@@ -223,22 +223,15 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// Resolves the TrackingSpace transform — the parent of the XR cameras that
-        /// MRUK world-lock can reposition each frame. Using this instead of the XROrigin
-        /// root ensures depth-to-world conversion includes the world-lock offset.
+        /// Resolves the tracking-space transform — the parent of the XR cameras
+        /// that world-locking can reposition each frame. Using this instead of the
+        /// XROrigin root ensures depth-to-world conversion includes that offset.
         /// </summary>
         private void CacheTrackingSpaceTransform()
         {
-            // Prefer OVRCameraRig.trackingSpace (most reliable on Meta devices)
-            var ovrRig = FindAnyObjectByType<OVRCameraRig>();
-            if (ovrRig != null && ovrRig.trackingSpace != null)
-            {
-                _trackingSpaceTransform = ovrRig.trackingSpace;
-                Logger.Info($"DepthCapture: using OVRCameraRig.trackingSpace '{_trackingSpaceTransform.name}'");
-                return;
-            }
-
-            // Fallback: XROrigin.CameraFloorOffsetObject
+            // XROrigin.CameraFloorOffsetObject is the tracking-space parent
+            // under OpenXR: it carries the floor offset the camera rides on.
+            // Prefer it over the XROrigin root.
             if (_xrOrigin != null && _xrOrigin.CameraFloorOffsetObject != null)
             {
                 _trackingSpaceTransform = _xrOrigin.CameraFloorOffsetObject.transform;

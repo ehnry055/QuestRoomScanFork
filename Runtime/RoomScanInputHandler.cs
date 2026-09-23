@@ -24,7 +24,7 @@ namespace Genesis.RoomScan
     }
 
     /// <summary>
-    /// Maps a single OVRInput button to a <see cref="ScanAction"/>.
+    /// Maps a single controller button to a <see cref="ScanAction"/>.
     /// Disable individual bindings by setting <see cref="enabled"/> to false,
     /// or remove/replace the entire <see cref="RoomScanInputHandler"/> component.
     /// </summary>
@@ -32,12 +32,12 @@ namespace Genesis.RoomScan
     public class ScanInputBinding
     {
         public ScanAction action = ScanAction.None;
-        public OVRInput.Button button = OVRInput.Button.None;
+        public ScanButton button = ScanButton.None;
         public bool enabled = true;
     }
 
     /// <summary>
-    /// Optional component that polls OVRInput each frame and calls the
+    /// Optional component that polls controller input each frame and calls the
     /// corresponding <see cref="RoomScanner"/> public API methods.
     ///
     /// Clients can:
@@ -51,17 +51,17 @@ namespace Genesis.RoomScan
         [SerializeField, Tooltip("Controller button → action mappings. Editable at runtime.")]
         private List<ScanInputBinding> bindings = new()
         {
-            // Left thumbstick click. NOTE: OVRInput.Button.Start (left ≡) is
-            // NOT reserved by Horizon OS — only the right Meta/Oculus logo
-            // button is. We use thumbstick-click here instead so host apps
-            // remain free to wire Button.Start to their own pause menu, which
-            // is the standard convention on Quest titles.
-            new() { action = ScanAction.ToggleDebugMenu,     button = OVRInput.Button.PrimaryThumbstick, enabled = true },
-            new() { action = ScanAction.FreezeInView,        button = OVRInput.Button.One,   enabled = true },
-            new() { action = ScanAction.UnfreezeInView,      button = OVRInput.Button.Two,   enabled = true },
-            new() { action = ScanAction.CycleRenderMode,     button = OVRInput.Button.Three, enabled = true },
-            new() { action = ScanAction.StartServerTraining,  button = OVRInput.Button.Four,  enabled = false },
-            new() { action = ScanAction.ToggleFreezeTint,      button = OVRInput.Button.None,  enabled = false },
+            // Left thumbstick click. NOTE: ScanButton.LeftMenu (left ≡) is
+            // NOT reserved by Horizon OS — only the right system button is.
+            // We use thumbstick-click here instead so host apps remain free to
+            // wire LeftMenu to their own pause menu, which is the standard
+            // convention on Quest titles.
+            new() { action = ScanAction.ToggleDebugMenu,     button = ScanButton.LeftThumbstickClick, enabled = true },
+            new() { action = ScanAction.FreezeInView,        button = ScanButton.RightPrimary,   enabled = true },
+            new() { action = ScanAction.UnfreezeInView,      button = ScanButton.RightSecondary,   enabled = true },
+            new() { action = ScanAction.CycleRenderMode,     button = ScanButton.LeftPrimary, enabled = true },
+            new() { action = ScanAction.StartServerTraining,  button = ScanButton.LeftSecondary,  enabled = false },
+            new() { action = ScanAction.ToggleFreezeTint,      button = ScanButton.None,  enabled = false },
         };
 
         /// <summary>
@@ -72,7 +72,7 @@ namespace Genesis.RoomScan
         /// <summary>
         /// Convenience: add a new binding at runtime.
         /// </summary>
-        public void AddBinding(ScanAction action, OVRInput.Button button)
+        public void AddBinding(ScanAction action, ScanButton button)
         {
             bindings.Add(new ScanInputBinding { action = action, button = button, enabled = true });
         }
@@ -88,7 +88,7 @@ namespace Genesis.RoomScan
         /// <summary>
         /// Remove all bindings for a given button.
         /// </summary>
-        public void RemoveBindingsForButton(OVRInput.Button button)
+        public void RemoveBindingsForButton(ScanButton button)
         {
             bindings.RemoveAll(b => b.button == button);
         }
@@ -109,10 +109,10 @@ namespace Genesis.RoomScan
             for (int i = 0; i < bindings.Count; i++)
             {
                 var b = bindings[i];
-                if (!b.enabled || b.action == ScanAction.None || b.button == OVRInput.Button.None)
+                if (!b.enabled || b.action == ScanAction.None || b.button == ScanButton.None)
                     continue;
 
-                if (!OVRInput.GetDown(b.button))
+                if (!XRControllerInput.GetDown(b.button))
                     continue;
 
                 ExecuteAction(scanner, b.action);

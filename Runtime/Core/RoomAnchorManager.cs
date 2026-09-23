@@ -1,62 +1,34 @@
 using System;
 using System.Collections;
-using System.Collections.Generic;
 using System.Threading.Tasks;
-using Meta.XR.MRUtilityKit;
 using UnityEngine;
 
 namespace Genesis.RoomScan
 {
     /// <summary>
-    /// Room anchor manager. Uses MRUK for runtime world-locking and provides
-    /// <see cref="OVRSpatialAnchor"/>-based persistence for reliable cross-session relocation.
-    /// Computes per-artifact relocation matrices via <c>R = A_now * Inv(A_create)</c>.
+    /// Galaxy XR-compatible room anchor manager.
+    ///
+    /// The core TSDF + mesh reconstruction pipeline does not depend on MRUK room
+    /// discovery. This shim preserves the public API and keeps the scan flow running
+    /// without the later MRUK scene and room-understanding steps.
     /// </summary>
     [DisallowMultipleComponent]
     public class RoomAnchorManager : MonoBehaviour, IRoomScanModule
     {
-        /// <inheritdoc />
         public string ModuleName => "Room Anchor";
-
-        /// <inheritdoc />
         public void OnModuleInitialize(RoomScanner scanner) { }
 
-        /// <summary>Singleton instance set in <see cref="Awake"/>.</summary>
         public static RoomAnchorManager Instance { get; private set; }
 
-        /// <summary>
-        /// Raised once when <c>LoadSceneFromDevice</c> has finished (including
-        /// zero rooms). Native discovery adds every room and scene anchor
-        /// (<c>OnSceneAnchorAdded</c>) <b>before</b>
-        /// <c>OnDiscoveryFinished</c>; MRUK then raises
-        /// <c>SceneLoadedEvent</c>. Wait here or on
-        /// <see cref="WaitUntilRoomReadyAsync"/>.
-        /// Later room/anchor changes are <c>RoomUpdatedEvent</c> /
-        /// <c>AnchorCreatedEvent</c> (forwarded as
-        /// <c>RoomScanSession.SceneAnchorsChanged</c>).
-        /// </summary>
         public event Action RoomReady;
 
-        /// <summary>True after <see cref="RoomReady"/> — MRUK discovery
-        /// finished (including <c>NoRoomsFound</c>).</summary>
         public bool IsRoomLoaded { get; private set; }
-
-        /// <summary>True when MRUK has at least one room after discovery.
-        /// Distinct from <see cref="IsRoomLoaded"/>: a finished load with
-        /// no scene model is a valid empty space, not a hang. Distinct from
-        /// <see cref="RoomScanSession.IsHeadsetInsideASceneRoom"/>: rooms can exist for a
-        /// different space than the one the headset is standing in.</summary>
         public bool HasSceneRooms { get; private set; }
 
-        readonly System.Threading.Tasks.TaskCompletionSource<bool> _readyTcs =
-            new(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
-        bool _readySignaled;
-
-        private MRUK _mruk;
+        private readonly TaskCompletionSource<bool> _readyTcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private bool _readySignaled;
         private Transform _anchorTransform;
-
-        private OVRSpatialAnchor _activeSpatialAnchor;
-        private readonly List<OVRSpatialAnchor.UnboundAnchor> _unboundAnchors = new();
 
         private void Awake()
         {
@@ -65,173 +37,60 @@ namespace Genesis.RoomScan
 
         private IEnumerator Start()
         {
-            if (!enabled)
-            {
-                MarkRoomReady(hasRooms: false);
-                yield break;
-            }
-
-            _mruk = FindAnyObjectByType<MRUK>();
-            if (_mruk == null)
-            {
-                var go = new GameObject("[MRUK]");
-                go.transform.SetParent(transform, false);
-                _mruk = go.AddComponent<MRUK>();
-            }
-
-            _mruk.SceneSettings ??= new MRUK.MRUKSettings();
-            _mruk.SceneSettings.DataSource = MRUK.SceneDataSource.Device;
-            _mruk.SceneSettings.LoadSceneOnStartup = false;
-            // V2 is HiFi room mesh (layout faces). Furniture volumes (SCREEN,
-            // TABLE, …) live on V1. HiFi is unsupported; V2FallbackV1 never
-            // falls back on a Quest 3 that already has a room mesh.
-            _mruk.SceneSettings.EnableHighFidelityScene = false;
-
-            if (_mruk.SceneLoadedEvent != null)
-                _mruk.SceneLoadedEvent.AddListener(OnSceneLoaded);
-
-            yield return null;
-
-            // Do not request Horizon Space Setup from this load. A missing
-            // scene model is a host decision (offer a card, then call
-            // RequestSpaceSetupAndReloadAsync at most once). The previous
-            // default (requestSceneCaptureIfNoDataFound: true) paused the
-            // Unity app into Meta's UI with no host copy, and on cancel
-            // SceneLoadedEvent never fired so RoomReady hung.
-            Logger.Info("MRUK LoadSceneFromDevice (V1, capture=false)...");
-            var loadTask = _mruk.LoadSceneFromDevice(
-                requestSceneCaptureIfNoDataFound: false,
-                removeMissingRooms: true,
-                sceneModel: MRUK.SceneModel.V1);
-            while (!loadTask.IsCompleted)
-                yield return null;
-
-            if (loadTask.Exception != null)
-                Logger.Error($"LoadSceneFromDevice failed: {loadTask.Exception.GetBaseException().Message}");
-            else
-                Logger.Info($"LoadSceneFromDevice finished result={loadTask.Result}");
-
-            // Discovery is done: native OnSceneAnchorAdded has already run
-            // for every wall and furniture volume, then OnDiscoveryFinished
-            // completed this task, then SceneLoadedEvent. No settle wait.
-            BindFloorFromRooms();
-            bool hasRooms = _mruk.Rooms != null && _mruk.Rooms.Count > 0;
-            if (!hasRooms)
-                Logger.Warning(
-                    "MRUK load finished without rooms — treating as empty " +
-                    "(IsRoomLoaded/RoomReady still signal so hosts are not stuck).");
-            MarkRoomReady(hasRooms);
+            MarkRoomReady(hasRooms: false);
+            yield break;
         }
 
-        /// <summary>
-        /// Completes when MRUK <c>LoadSceneFromDevice</c> has finished.
-        /// All discovery anchors are already on the rooms. Completed
-        /// immediately if it already has.
-        /// </summary>
-        public System.Threading.Tasks.Task WaitUntilRoomReadyAsync()
+        public Task WaitUntilRoomReadyAsync()
         {
-            if (IsRoomLoaded) return System.Threading.Tasks.Task.CompletedTask;
+            if (IsRoomLoaded) return Task.CompletedTask;
             return _readyTcs.Task;
         }
 
-        /// <summary>
-        /// Re-run <c>LoadSceneFromDevice</c> with capture off. The first
-        /// <see cref="Start"/> load often finishes with zero rooms when
-        /// spatial-data permission was still denied; after the host grants
-        /// it, call this before treating <see cref="HasSceneRooms"/> as
-        /// "this space has no scene model".
-        /// </summary>
-        public async System.Threading.Tasks.Task<bool> ReloadSceneFromDeviceAsync()
+        public Task<bool> ReloadSceneFromDeviceAsync() => Task.FromResult(HasSceneRooms);
+        public Task<bool> RequestSpaceSetupAndReloadAsync() => Task.FromResult(HasSceneRooms);
+
+        public Matrix4x4 GetRoomLocalToWorldForPersistence() =>
+            _anchorTransform != null ? _anchorTransform.localToWorldMatrix : Matrix4x4.identity;
+
+        public static Matrix4x4 ComputeRelocationMatrix(Matrix4x4 anchorNow, Matrix4x4 anchorAtSave)
         {
-            if (_mruk == null) return HasSceneRooms;
-
-            Logger.Info("MRUK LoadSceneFromDevice reload (V1, capture=false)...");
-            try
-            {
-                var result = await _mruk.LoadSceneFromDevice(
-                    requestSceneCaptureIfNoDataFound: false,
-                    removeMissingRooms: true,
-                    sceneModel: MRUK.SceneModel.V1);
-                Logger.Info($"LoadSceneFromDevice reload result={result}");
-            }
-            catch (Exception ex)
-            {
-                Logger.Error($"LoadSceneFromDevice reload failed: {ex.Message}");
-            }
-
-            BindFloorFromRooms();
-            bool hasRooms = _mruk.Rooms != null && _mruk.Rooms.Count > 0;
-            MarkRoomReady(hasRooms);
-            return HasSceneRooms;
+            return anchorNow * anchorAtSave.inverse;
         }
 
-        /// <summary>
-        /// Opens Horizon Space Setup (pauses the Unity app), then reloads
-        /// the scene model with capture <b>off</b>. Returns true only when
-        /// rooms exist after that reload — <c>RequestSpaceSetup</c> itself
-        /// completes true on cancel, which is not success-with-rooms.
-        /// Call at most once per empty-space offer. Device-only.
-        /// </summary>
-        public async System.Threading.Tasks.Task<bool> RequestSpaceSetupAndReloadAsync()
+        public Matrix4x4 ComputeRelocationMatrix(Matrix4x4 anchorAtSave)
         {
-            if (_mruk == null) return HasSceneRooms;
-            if (Application.isEditor)
-            {
-                Logger.Warning("Space Setup is a device-only Horizon flow.");
-                return HasSceneRooms;
-            }
-
-            Logger.Info("Requesting Horizon Space Setup (at most once)...");
-            bool completed = await OVRScene.RequestSpaceSetup();
-            Logger.Info($"RequestSpaceSetup completed={completed} (true on cancel too — check rooms)");
-            return await ReloadSceneFromDeviceAsync();
+            return ComputeRelocationMatrix(
+                _anchorTransform != null ? _anchorTransform.localToWorldMatrix : Matrix4x4.identity,
+                anchorAtSave);
         }
 
-        int CountLoadedAnchors()
+        public Matrix4x4 SpatialAnchorMatrix => Matrix4x4.identity;
+        public bool HasSpatialAnchor => false;
+        public Transform SpatialAnchorTransform => null;
+        public Guid SpatialAnchorUuid => Guid.Empty;
+
+        public Task<(Guid uuid, Matrix4x4 matrix)?> CreateAndSaveSpatialAnchorAsync(Vector3 position, Quaternion rotation)
         {
-            if (_mruk == null || _mruk.Rooms == null) return 0;
-            int n = 0;
-            for (int i = 0; i < _mruk.Rooms.Count; i++)
-            {
-                var room = _mruk.Rooms[i];
-                if (room != null && room.Anchors != null)
-                    n += room.Anchors.Count;
-            }
-            return n;
+            var go = new GameObject("[GalaxyAnchor]");
+            go.transform.SetPositionAndRotation(position, rotation);
+            _anchorTransform = go.transform;
+            return Task.FromResult<(Guid uuid, Matrix4x4 matrix)?>((Guid.Empty, Matrix4x4.identity));
         }
 
-        void BindFloorFromRooms()
+        public Task<Matrix4x4?> LoadSpatialAnchorAsync(Guid uuid)
         {
-            if (_mruk == null || _mruk.Rooms == null || _mruk.Rooms.Count == 0)
-                return;
-
-            MRUKRoom room = RoomUnderstanding.Query.FindContaining(
-                                _mruk.Rooms,
-                                RoomUnderstanding.Query.HeadsetWorldPosition())
-                            ?? _mruk.Rooms[0];
-            if (room == null) return;
-
-            MRUKAnchor floorAnchor = null;
-            if (room.FloorAnchors != null && room.FloorAnchors.Count > 0)
-                floorAnchor = room.FloorAnchors[0];
-
-            _anchorTransform = floorAnchor != null ? floorAnchor.transform : room.transform;
-            if (floorAnchor != null)
-                Logger.Info($"Using floor MRUKAnchor '{floorAnchor.name}' " +
-                          $"(label={floorAnchor.Label}) pos={_anchorTransform.position}");
-            else if (_anchorTransform != null)
-                Logger.Warning($"No FloorAnchors — falling back to MRUKRoom.transform (pos={_anchorTransform.position})");
+            return Task.FromResult<Matrix4x4?>(Matrix4x4.identity);
         }
 
-        void MarkRoomReady(bool hasRooms)
+        public void UnloadActiveSpatialAnchor() { }
+        public Task<bool> EraseSpatialAnchorAsync(Guid uuid) => Task.FromResult(true);
+
+        private void MarkRoomReady(bool hasRooms)
         {
             HasSceneRooms = hasRooms;
             IsRoomLoaded = true;
-            Logger.Info(
-                $"Room ready — rooms={(_mruk != null && _mruk.Rooms != null ? _mruk.Rooms.Count : 0)} " +
-                $"anchors={CountLoadedAnchors()}");
-            if (_readySignaled)
-                return;
+            if (_readySignaled) return;
             _readySignaled = true;
             _readyTcs.TrySetResult(true);
             RoomReady?.Invoke();
@@ -239,328 +98,8 @@ namespace Genesis.RoomScan
 
         private void OnDestroy()
         {
-            if (_mruk != null && _mruk.SceneLoadedEvent != null)
-                _mruk.SceneLoadedEvent.RemoveListener(OnSceneLoaded);
             _readyTcs.TrySetResult(false);
-            if (Instance == this)
-                Instance = null;
-        }
-
-        private void OnSceneLoaded()
-        {
-            // LoadSceneFromDevice already added every discovery anchor
-            // before this event. Bind the floor; RoomReady is signaled
-            // when that task completes, including NoRoomsFound.
-            if (!enabled) return;
-            BindFloorFromRooms();
-        }
-
-        // ─────────────────────────────────────────────────────────────
-        //  MRUK fallback API (unchanged)
-        // ─────────────────────────────────────────────────────────────
-
-        /// <summary>
-        /// Floor MRUK anchor → world matrix. Used as fallback when spatial anchor
-        /// localization fails. Main thread only.
-        /// </summary>
-        public Matrix4x4 GetRoomLocalToWorldForPersistence()
-        {
-            return _anchorTransform != null ? _anchorTransform.localToWorldMatrix : Matrix4x4.identity;
-        }
-
-        /// <summary>
-        /// One-shot relocation: <c>R = A_now * Inv(A_save)</c>.
-        /// </summary>
-        public static Matrix4x4 ComputeRelocationMatrix(Matrix4x4 anchorNow, Matrix4x4 anchorAtSave)
-        {
-            Matrix4x4 reloc = anchorNow * anchorAtSave.inverse;
-            Logger.Info($"ComputeRelocation: R = A_now * Inv(A_save)\n" +
-                      $"  A_save col3(pos): {anchorAtSave.GetColumn(3)}\n" +
-                      $"  A_now  col3(pos): {anchorNow.GetColumn(3)}\n" +
-                      $"  R      col3(pos): {reloc.GetColumn(3)}");
-            return reloc;
-        }
-
-        /// <summary>
-        /// Overload for backward compat — uses the current MRUK anchor as A_now.
-        /// </summary>
-        public Matrix4x4 ComputeRelocationMatrix(Matrix4x4 anchorAtSave)
-        {
-            Matrix4x4 aNow = _anchorTransform != null ? _anchorTransform.localToWorldMatrix : Matrix4x4.identity;
-            return ComputeRelocationMatrix(aNow, anchorAtSave);
-        }
-
-        // ─────────────────────────────────────────────────────────────
-        //  OVRSpatialAnchor API
-        // ─────────────────────────────────────────────────────────────
-
-        /// <summary>
-        /// Current spatial anchor localization matrix. Valid after
-        /// <see cref="CreateAndSaveSpatialAnchorAsync"/> or <see cref="LoadSpatialAnchorAsync"/>.
-        /// Returns identity if no spatial anchor is active.
-        ///
-        /// <para><b>Persisting data baked in world space.</b> Store this
-        /// alongside the data at the moment you bake it, and on load multiply
-        /// by <c>ComputeRelocationMatrix(SpatialAnchorMatrix, stored)</c> to
-        /// bring it into the current session's world frame. This is how the
-        /// refined mesh survives a restart, and it is the right recipe only for
-        /// data a transform cannot move — vertex buffers, precomputed fields.
-        /// Anything you can parent should use <see cref="RoomSpaceRoot"/>
-        /// instead and store plain local coordinates.</para>
-        /// </summary>
-        public Matrix4x4 SpatialAnchorMatrix =>
-            _activeSpatialAnchor != null
-                ? _activeSpatialAnchor.transform.localToWorldMatrix
-                : Matrix4x4.identity;
-
-        /// <summary>
-        /// Whether a spatial anchor is currently loaded and localized.
-        /// </summary>
-        public bool HasSpatialAnchor => _activeSpatialAnchor != null;
-
-        /// <summary>
-        /// Live transform of the active spatial anchor. Parenting under it keeps
-        /// content world-locked across tracking corrections.
-        ///
-        /// <para><b>Parenting under this alone does not make coordinates
-        /// persistent.</b> <c>SetParent(anchor, worldPositionStays: true)</c>
-        /// preserves the child's world pose and stores the difference as a local
-        /// offset, so its local space remains world space plus a constant — and
-        /// Unity's world origin is wherever the headset booted, so it means a
-        /// different physical place next run. Within one session that is
-        /// invisible, which is what makes it a trap. Use
-        /// <see cref="RoomSpaceRoot"/>, which holds its own local transform at
-        /// identity so that local space genuinely is the anchor's space.</para>
-        /// </summary>
-        public Transform SpatialAnchorTransform =>
-            _activeSpatialAnchor != null ? _activeSpatialAnchor.transform : null;
-
-        /// <summary>UUID of the active spatial anchor, or <see cref="Guid.Empty"/>.</summary>
-        public Guid SpatialAnchorUuid =>
-            _activeSpatialAnchor != null ? _activeSpatialAnchor.Uuid : Guid.Empty;
-
-        /// <summary>
-        /// Creates an <see cref="OVRSpatialAnchor"/> at the given world pose, waits for
-        /// creation, persists it, and returns the UUID + localToWorld matrix.
-        /// Falls back to MRUK anchor position if <paramref name="position"/> is default.
-        /// </summary>
-        public async Task<(Guid uuid, Matrix4x4 matrix)?> CreateAndSaveSpatialAnchorAsync(
-            Vector3 position, Quaternion rotation)
-        {
-            if (position == Vector3.zero && rotation == Quaternion.identity && _anchorTransform != null)
-            {
-                position = _anchorTransform.position;
-                rotation = _anchorTransform.rotation;
-            }
-
-            var go = new GameObject("[SpatialAnchor]");
-            go.transform.SetPositionAndRotation(position, rotation);
-            var anchor = go.AddComponent<OVRSpatialAnchor>();
-
-            // Wait for async creation (up to 5s)
-            float timeout = 5f;
-            float elapsed = 0f;
-            while (!anchor.Created && elapsed < timeout)
-            {
-                await Task.Yield();
-                elapsed += Time.unscaledDeltaTime;
-            }
-
-            if (!anchor.Created)
-            {
-                Logger.Error("Spatial anchor creation timed out");
-                Destroy(go);
-                return null;
-            }
-
-            Logger.Info($"Spatial anchor created: {anchor.Uuid}, pos={position}");
-
-            var saveResult = await anchor.SaveAnchorAsync();
-            if (!saveResult.Success)
-            {
-                Logger.Error($"Spatial anchor save failed: {saveResult.Status}");
-                Destroy(go);
-                return null;
-            }
-
-            Logger.Info($"Spatial anchor persisted: {anchor.Uuid}");
-
-            // Wait a few frames for transform to stabilize
-            await StabilizeAnchorTransform(anchor.transform);
-
-            if (_activeSpatialAnchor != null && _activeSpatialAnchor.gameObject != go)
-            {
-                // Consumers (game-side WorldRoot, refined-mesh holder, etc.)
-                // commonly parent anchor-tracked content under the active
-                // [SpatialAnchor] GO so it stays glued to the room across
-                // drift correction. Destroying the GO with those children
-                // still attached recursively destroys them too — the
-                // gameplay scene loses its world root and the player's
-                // UI vanishes mid-rescan. Detach first with world pose
-                // preserved so the children survive and a downstream
-                // adopter (e.g. WorldRoot.Update polling
-                // SpatialAnchorTransform) can reparent them under the
-                // new anchor on the next frame.
-                DetachChildrenForReparent(_activeSpatialAnchor.transform);
-                Destroy(_activeSpatialAnchor.gameObject);
-            }
-            _activeSpatialAnchor = anchor;
-
-            Matrix4x4 matrix = anchor.transform.localToWorldMatrix;
-            return (anchor.Uuid, matrix);
-        }
-
-        /// <summary>
-        /// Loads a previously persisted spatial anchor by UUID, localizes it, and returns
-        /// the anchor's current localToWorld matrix. Returns null on failure.
-        /// Falls back to MRUK anchor if localization fails.
-        /// </summary>
-        public async Task<Matrix4x4?> LoadSpatialAnchorAsync(Guid uuid)
-        {
-            Logger.Info($"Loading spatial anchor {uuid}...");
-
-            var loadResult = await OVRSpatialAnchor.LoadUnboundAnchorsAsync(
-                new[] { uuid }, _unboundAnchors);
-
-            if (!loadResult.Success || _unboundAnchors.Count == 0)
-            {
-                Logger.Warning($"Spatial anchor load failed: {loadResult.Status}, " +
-                                 $"count={_unboundAnchors.Count}. Falling back to MRUK.");
-                return null;
-            }
-
-            var unbound = _unboundAnchors[0];
-
-            bool localized = await unbound.LocalizeAsync();
-            if (!localized && !unbound.Localized)
-            {
-                // Poll for localization (up to 10s)
-                float timeout = 10f;
-                float elapsed = 0f;
-                while (!unbound.Localized && elapsed < timeout)
-                {
-                    await Task.Yield();
-                    elapsed += Time.unscaledDeltaTime;
-                }
-                if (!unbound.Localized)
-                {
-                    Logger.Warning("Spatial anchor localization timed out. Falling back to MRUK.");
-                    return null;
-                }
-            }
-
-            // Bind to a new OVRSpatialAnchor GO
-            var go = new GameObject($"[SpatialAnchor-{uuid:N}]");
-            var anchor = go.AddComponent<OVRSpatialAnchor>();
-            unbound.BindTo(anchor);
-
-            Logger.Info($"Spatial anchor localized: {uuid}, pos={anchor.transform.position}");
-
-            await StabilizeAnchorTransform(anchor.transform);
-
-            if (_activeSpatialAnchor != null && _activeSpatialAnchor.gameObject != go)
-            {
-                // See note in CreateAndSaveSpatialAnchorAsync: detach
-                // children first so anchor-tracked scene content (game-side
-                // WorldRoot, refined-mesh holder, etc.) survives the
-                // destroy and can be re-adopted under the new anchor on
-                // the next frame.
-                DetachChildrenForReparent(_activeSpatialAnchor.transform);
-                Destroy(_activeSpatialAnchor.gameObject);
-            }
-            _activeSpatialAnchor = anchor;
-
-            return anchor.transform.localToWorldMatrix;
-        }
-
-        /// <summary>
-        /// Drops the in-memory spatial-anchor GameObject without erasing its
-        /// UUID from Horizon OS. Saved packages keep that uuid in
-        /// <c>anchor.json</c> and can be loaded again later. Use this when
-        /// leaving a loaded scan to start a new one in the same session, so
-        /// the new scan gets its own <see cref="OVRSpatialAnchor"/> rather
-        /// than a second one created beside a still-bound predecessor.
-        /// <para>
-        /// Direct children are detached with world pose preserved first so
-        /// host content parented under the anchor (a room-space root, etc.)
-        /// is not destroyed with the GameObject.
-        /// </para>
-        /// </summary>
-        public void UnloadActiveSpatialAnchor()
-        {
-            if (_activeSpatialAnchor == null) return;
-            DetachChildrenForReparent(_activeSpatialAnchor.transform);
-            Destroy(_activeSpatialAnchor.gameObject);
-            _activeSpatialAnchor = null;
-            Logger.Info("Spatial anchor unloaded (UUID kept on disk)");
-        }
-
-        /// <summary>
-        /// Erases a spatial anchor from persistent storage by UUID.
-        /// Does not require the anchor to be loaded.
-        /// </summary>
-        public async Task<bool> EraseSpatialAnchorAsync(Guid uuid)
-        {
-            Logger.Info($"Erasing spatial anchor {uuid}...");
-            var result = await OVRSpatialAnchor.EraseAnchorsAsync(
-                null, new[] { uuid });
-
-            if (result.Success)
-                Logger.Info($"Spatial anchor erased: {uuid}");
-            else
-                Logger.Warning($"Spatial anchor erase failed: {result.Status}");
-
-            return result.Success;
-        }
-
-        /// <summary>
-        /// Reparent every direct child of <paramref name="oldAnchor"/> to the
-        /// scene root with world pose preserved. Called immediately before
-        /// destroying a superseded <c>[SpatialAnchor]</c> GameObject so that
-        /// anchor-tracked content parented underneath (e.g. the game-side
-        /// <c>WorldRoot</c>, refined-mesh holder GameObjects) is not
-        /// recursively destroyed by Unity's child-cascade. Once detached,
-        /// any consumer polling <see cref="SpatialAnchorTransform"/> (the
-        /// canonical pattern: <c>WorldRoot.Update</c>) will reparent them
-        /// under the new active anchor on the next frame, also with world
-        /// pose preserved — the player sees no visible jump.
-        ///
-        /// <para>
-        /// Iterates index 0 in a loop because <c>SetParent(null, ...)</c>
-        /// mutates the child collection, so a forward-index <c>for</c> would
-        /// skip every other element.
-        /// </para>
-        /// </summary>
-        private static void DetachChildrenForReparent(Transform oldAnchor)
-        {
-            if (oldAnchor == null) return;
-            while (oldAnchor.childCount > 0)
-            {
-                var child = oldAnchor.GetChild(0);
-                child.SetParent(null, worldPositionStays: true);
-            }
-        }
-
-        /// <summary>
-        /// Waits for an anchor transform to stabilize (5 consecutive frames with &lt; 1mm movement).
-        /// </summary>
-        private static async Task StabilizeAnchorTransform(Transform t)
-        {
-            int stableFrames = 0;
-            const int required = 5;
-            const int maxPolls = 60;
-            Vector3 prevPos = t.position;
-
-            for (int i = 0; i < maxPolls && stableFrames < required; i++)
-            {
-                await Task.Yield();
-                float delta = Vector3.Distance(prevPos, t.position);
-                if (delta < 0.001f)
-                    stableFrames++;
-                else
-                    stableFrames = 0;
-                prevPos = t.position;
-            }
+            if (Instance == this) Instance = null;
         }
     }
 }

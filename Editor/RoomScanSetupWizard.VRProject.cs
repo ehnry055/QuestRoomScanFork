@@ -63,7 +63,7 @@ namespace Genesis.RoomScan.Editor
 
             EditorGUILayout.HelpBox(
                 "Audits and fixes project-level VR config (XR Plug-in Management, OpenXR " +
-                "features, PlayerSettings, OVRProjectConfig, Meta XR Project Setup Tool).\n" +
+                "features, PlayerSettings, OpenXR feature set).\n" +
                 "Generic to every Quest project — does not write per-game identity.",
                 MessageType.Info);
 

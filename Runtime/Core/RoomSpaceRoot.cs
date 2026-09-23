@@ -61,7 +61,7 @@ namespace Genesis.RoomScan
         [SerializeField] protected bool verbose = true;
 
         [Tooltip("Editor/testing only: bind to this Transform instead of polling " +
-                 "RoomAnchorManager for a real OVRSpatialAnchor, neither of which " +
+                 "RoomAnchorManager for a real AR anchor, neither of which " +
                  "work in playmode without a headset. Leave null on device.")]
         [SerializeField] protected Transform anchorOverride;
 

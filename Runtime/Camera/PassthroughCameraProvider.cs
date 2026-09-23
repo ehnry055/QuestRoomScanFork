@@ -1,101 +1,110 @@
-using System;
 using System.Threading.Tasks;
-using Meta.XR;
 using UnityEngine;
-#if UNITY_ANDROID && !UNITY_EDITOR
-using UnityEngine.Android;
-#endif
+using UnityEngine.XR.ARFoundation;
+using UnityEngine.XR.ARSubsystems;
 
 namespace Genesis.RoomScan
 {
     /// <summary>
-    /// Camera provider backed by Meta's PassthroughCameraAccess (Quest 3+).
-    /// Provides intrinsics, extrinsics, and RGB frames from the headset cameras.
+    /// Camera provider backed by ARFoundation's <see cref="ARCameraManager"/>
+    /// (Quest 3+ via the Meta OpenXR provider). Provides intrinsics, pose, and
+    /// RGB frames from the headset cameras.
     ///
     /// <para>
-    /// PCA discovery is <b>scene-wide</b> (not GameObject-local): if the Meta XR
-    /// Building Block already dropped a <see cref="PassthroughCameraAccess"/>
-    /// onto an OVRCameraRig, the provider re-uses it. Without scene-wide find
-    /// we ended up with two PCA components fighting over the single native
-    /// camera handle — first session worked, subsequent sessions stuck because
-    /// PCA self-disables when <c>Play()</c> fails.
+    /// The manager is discovered <b>scene-wide</b> rather than per-GameObject:
+    /// exactly one <see cref="ARCameraManager"/> drives the single native camera
+    /// handle, and creating a second one leaves neither able to run. This
+    /// provider therefore adopts whatever the XR rig already has and never adds
+    /// its own.
     /// </para>
-    /// RGB capture starts only from <see cref="StartCapture"/> (scan start)
-    /// and stops from <see cref="StopCapture"/>. The scene component is
-    /// disabled at Awake so a Building Block left enabled does not open the
-    /// headset cameras at boot. HEADSET_CAMERA is still requested by the host
-    /// via <see cref="RequestCameraPermissionAsync"/> — that is independent
-    /// of starting capture.
+    /// Frame delivery starts only from <see cref="StartCapture"/> (scan start)
+    /// and stops from <see cref="StopCapture"/>. HEADSET_CAMERA is requested by
+    /// the host via <see cref="RequestCameraPermissionAsync"/> — that is
+    /// independent of starting capture.
     /// </summary>
     [DefaultExecutionOrder(-50)]
     public class PassthroughCameraProvider : MonoBehaviour, ICameraProvider, ICameraFrameTiming
     {
-        /// <summary>The Horizon OS permission required by PCA on Quest 3+.</summary>
+        /// <summary>The Horizon OS permission required for camera access on Quest 3+.</summary>
         public const string CameraPermissionId = AndroidRuntimePermission.Camera;
 
-        [SerializeField] private PassthroughCameraAccess.CameraPositionType cameraPosition =
-            PassthroughCameraAccess.CameraPositionType.Left;
         [SerializeField] private Vector2Int requestedResolution = new(1280, 960);
-        [SerializeField] private int maxFramerate = 30;
 
-        private PassthroughCameraAccess _pca;
+        private ARCameraManager _cameraManager;
+        private Texture _latestTexture;
+        private long _latestTimestampNs;
+        private int _latestFrame = -1;
+        private bool _capturing;
 
-        private void Awake()
+        private void Awake() => AdoptCameraManager();
+
+        /// <inheritdoc />
+        public bool IsReady => _capturing && _latestTexture != null && _latestFrame == Time.frameCount;
+
+        /// <inheritdoc />
+        public bool IsPlaying =>
+            _capturing && _cameraManager != null && _cameraManager.subsystem is { running: true };
+
+        /// <inheritdoc />
+        public Texture CurrentFrame => IsPlaying ? _latestTexture : null;
+
+        /// <summary>
+        /// World-space pose of the camera this frame.
+        /// <para>
+        /// This is the AR camera's pose, not a per-sensor extrinsic: the Meta
+        /// OpenXR provider does not surface the individual passthrough sensor
+        /// transform, so frames are treated as originating at the AR camera.
+        /// </para>
+        /// </summary>
+        public Pose CameraPose
         {
-            AdoptOrFindPca();
-            if (_pca != null)
-                _pca.enabled = false;
+            get
+            {
+                if (!IsPlaying) return Pose.identity;
+                var t = _cameraManager.transform;
+                return new Pose(t.position, t.rotation);
+            }
         }
 
         /// <inheritdoc />
-        public bool IsReady => _pca != null && _pca.IsPlaying && _pca.IsUpdatedThisFrame;
-
-        /// <inheritdoc />
-        public bool IsPlaying => _pca != null && _pca.IsPlaying;
-
-        /// <inheritdoc />
-        public Texture CurrentFrame => _pca != null && _pca.IsPlaying ? _pca.GetTexture() : null;
-
-        /// <inheritdoc />
-        public Pose CameraPose =>
-            _pca != null && _pca.IsPlaying ? _pca.GetCameraPose() : Pose.identity;
-
-        /// <inheritdoc />
         public double FrameTimeSeconds =>
-            _pca != null && _pca.IsPlaying
-                ? (_pca.Timestamp - DateTime.UnixEpoch).TotalSeconds
+            IsPlaying && _latestTimestampNs > 0
+                ? _latestTimestampNs * 1e-9d
                 : Time.realtimeSinceStartupAsDouble;
 
         /// <inheritdoc />
         public Vector2 FocalLength =>
-            _pca != null && _pca.IsPlaying ? _pca.Intrinsics.FocalLength : Vector2.one;
+            TryGetIntrinsics(out var i) ? i.focalLength : Vector2.one;
 
         /// <inheritdoc />
         public Vector2 PrincipalPoint =>
-            _pca != null && _pca.IsPlaying ? _pca.Intrinsics.PrincipalPoint : Vector2.zero;
+            TryGetIntrinsics(out var i) ? i.principalPoint : Vector2.zero;
 
         /// <inheritdoc />
         public Vector2 SensorResolution =>
-            _pca != null && _pca.IsPlaying ? _pca.Intrinsics.SensorResolution : new Vector2(1280, 960);
+            TryGetIntrinsics(out var i)
+                ? new Vector2(i.resolution.x, i.resolution.y)
+                : new Vector2(requestedResolution.x, requestedResolution.y);
 
         /// <inheritdoc />
         public Vector2 CurrentResolution =>
-            _pca != null && _pca.IsPlaying
-                ? new Vector2(_pca.CurrentResolution.x, _pca.CurrentResolution.y)
-                : new Vector2(1280, 960);
+            _latestTexture != null
+                ? new Vector2(_latestTexture.width, _latestTexture.height)
+                : SensorResolution;
+
+        private bool TryGetIntrinsics(out XRCameraIntrinsics intrinsics)
+        {
+            if (IsPlaying && _cameraManager.TryGetIntrinsics(out intrinsics))
+                return true;
+            intrinsics = default;
+            return false;
+        }
 
         /// <summary>
         /// True when the user has granted the Horizon OS HEADSET_CAMERA
         /// permission. Always true outside Android device builds.
         /// </summary>
-        public static bool HasCameraPermission
-        {
-#if UNITY_ANDROID && !UNITY_EDITOR
-            get => Permission.HasUserAuthorizedPermission(CameraPermissionId);
-#else
-            get => true;
-#endif
-        }
+        public static bool HasCameraPermission => AndroidRuntimePermission.Has(CameraPermissionId);
 
         /// <summary>
         /// Requests the HEADSET_CAMERA permission and resolves once the user
@@ -111,58 +120,66 @@ namespace Genesis.RoomScan
         {
             // No permission request here: RoomScanner.StartScanningAsync asks
             // through AndroidRuntimePermission (serialised) before bring-up. A
-            // bare RequestUserPermission from this spot raced that queue.
+            // bare request from this spot raced that queue.
             if (!AndroidRuntimePermission.Has(CameraPermissionId))
-                Logger.Warning("HEADSET_CAMERA not granted — PCA will not deliver frames; scanning depth-only.");
+                Logger.Warning("HEADSET_CAMERA not granted — no camera frames; scanning depth-only.");
 
-            AdoptOrFindPca();
-            if (_pca == null) return;
+            AdoptCameraManager();
+            if (_cameraManager == null || _capturing) return;
 
-            // PCA forbids MaxFramerate changes while running. Drive it disabled
-            // for the property writes, then re-enable so OnEnable runs cleanly.
-            // No-op if it was already disabled.
-            bool wasEnabled = _pca.enabled;
-            if (wasEnabled) _pca.enabled = false;
-            _pca.CameraPosition = cameraPosition;
-            _pca.RequestedResolution = requestedResolution;
-            _pca.MaxFramerate = maxFramerate;
-            _pca.enabled = true;
+            _cameraManager.frameReceived += OnFrameReceived;
+            _cameraManager.enabled = true;
+            _capturing = true;
         }
 
         /// <inheritdoc />
         public void StopCapture()
         {
-            if (_pca != null)
-                _pca.enabled = false;
+            if (!_capturing) return;
+            _capturing = false;
+
+            if (_cameraManager != null)
+            {
+                _cameraManager.frameReceived -= OnFrameReceived;
+                _cameraManager.enabled = false;
+            }
+
+            _latestTexture = null;
+            _latestFrame = -1;
+            _latestTimestampNs = 0;
         }
 
-        private void AdoptOrFindPca()
+        private void OnFrameReceived(ARCameraFrameEventArgs args)
         {
-            // Scene-wide find: re-use the PCA from the Meta XR Building Block
-            // (typically attached to OVRCameraRig). Falling back to a
-            // GameObject-local AddComponent here was the bug that caused two
-            // PCAs to race for the camera handle — PCA's native side allows
-            // exactly one instance per camera position, so the second one
-            // self-disables and from then on neither one plays.
-            if (_pca != null) return;
-
-            _pca = FindAnyObjectByType<PassthroughCameraAccess>(FindObjectsInactive.Include);
-            if (_pca == null)
+            if (args.textures != null && args.textures.Count > 0)
             {
-                Logger.Warning("PassthroughCameraProvider: no PassthroughCameraAccess in scene — adding one to " +
-                               $"'{gameObject.name}'. Prefer letting Meta's Building Block place it on the OVRCameraRig.");
-                _pca = gameObject.AddComponent<PassthroughCameraAccess>();
-                _pca.enabled = false;
+                _latestTexture = args.textures[0];
+                _latestFrame = Time.frameCount;
+            }
+
+            if (args.timestampNs.HasValue)
+                _latestTimestampNs = args.timestampNs.Value;
+        }
+
+        private void AdoptCameraManager()
+        {
+            if (_cameraManager != null) return;
+
+            _cameraManager = FindAnyObjectByType<ARCameraManager>(FindObjectsInactive.Include);
+            if (_cameraManager == null)
+            {
+                // Deliberately not added here: ARCameraManager must sit on the
+                // XROrigin's camera to produce correct poses, and a second one
+                // would contend for the single native camera handle.
+                Logger.Warning("PassthroughCameraProvider: no ARCameraManager in scene — " +
+                               "add one to the XR Origin's camera to enable camera frames.");
             }
             else
             {
-                Logger.Info($"PassthroughCameraProvider: adopted existing PassthroughCameraAccess on '{_pca.gameObject.name}'.");
+                Logger.Info($"PassthroughCameraProvider: adopted ARCameraManager on '{_cameraManager.gameObject.name}'.");
             }
         }
 
-        private void OnDestroy()
-        {
-            StopCapture();
-        }
+        private void OnDestroy() => StopCapture();
     }
 }

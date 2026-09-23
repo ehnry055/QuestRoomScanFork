@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
 using Genesis.RoomScan.UI;
+using Unity.XR.CoreUtils;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -525,9 +526,9 @@ namespace Genesis.RoomScan
         private readonly ShellCellSet _shellCells = new();
         private ShellCoverageTracker _shellTracker;
         private float _lastShellLog;
-        private OVRCameraRig _bodyRig;
-        private OVRHand _leftOvrHand;
-        private OVRHand _rightOvrHand;
+        private XROrigin _bodyRig;
+        private Transform _leftWrist;
+        private Transform _rightWrist;
 
         private void Update()
         {
@@ -1719,23 +1720,12 @@ namespace Genesis.RoomScan
 
         private void SubscribeToAnchorsChanged()
         {
-            if (_subscribedToAnchorsChanged || _roomUnderstanding == null) return;
-            _roomUnderstanding.AnchorsChanged += OnMrukAnchorsChanged;
-            _subscribedToAnchorsChanged = true;
+            _subscribedToAnchorsChanged = false;
         }
 
         private void UnsubscribeFromAnchorsChanged()
         {
-            if (!_subscribedToAnchorsChanged || _roomUnderstanding == null) return;
-            _roomUnderstanding.AnchorsChanged -= OnMrukAnchorsChanged;
             _subscribedToAnchorsChanged = false;
-        }
-
-        private void OnMrukAnchorsChanged()
-        {
-            Logger.Info("[RoomScanner] MRUK anchors changed — re-populating registry");
-            PopulateSceneObjectRegistry();
-            if (IsScanning) BindScanPriors();
         }
 
         void ResolveScanRoomUuid()
@@ -1749,53 +1739,18 @@ namespace Genesis.RoomScan
         {
             if (_volumeIntegrator == null)
                 return;
-            if (_roomUnderstanding == null)
-            {
-                _volumeIntegrator.ClearScanPriors();
-                return;
-            }
-
-            ResolveScanRoomUuid();
-            _roomUnderstanding.CopyRoomClipPlanes(_scanRoomUuid, _clipScratch);
-            if (stampScreenPlanes)
-                _roomUnderstanding.CopyScreenStamps(_scanRoomUuid, _stampScratch);
-            else
-                _stampScratch.Clear();
-            bool useAabb = false;
-            Vector3 aabbMin = Vector3.zero, aabbMax = Vector3.zero;
-            if (confineScanToContainingRoom)
-                useAabb = _roomUnderstanding.CopyRoomWorldAabb(
-                    _scanRoomUuid, out aabbMin, out aabbMax);
-            _volumeIntegrator.SetScanPriors(
-                confineScanToContainingRoom, _clipScratch, _stampScratch,
-                useAabb, aabbMin, aabbMax);
-
-            if (_stampScratch.Count > 0 || (confineScanToContainingRoom && _clipScratch.Count > 0))
-            {
-                Logger.Info(
-                    $"[RoomScanner] Scan priors — confine={confineScanToContainingRoom} " +
-                    $"room={_scanRoomUuid} clipPlanes={_clipScratch.Count} " +
-                    $"aabb={(useAabb ? 1 : 0)} screens={_stampScratch.Count}");
-            }
-
+            _clipScratch.Clear();
+            _stampScratch.Clear();
+            _volumeIntegrator.ClearScanPriors();
             BindShellCells();
         }
 
         void BindShellCells()
         {
             if (_volumeIntegrator == null || _shellTracker == null) return;
-            int uploaded = _roomUnderstanding != null
-                ? _roomUnderstanding.CopyShellCells(_scanRoomUuid, _shellCells)
-                : 0;
-            _volumeIntegrator.SetShellCells(_shellCells.GpuPos, _shellCells.GpuNrm, uploaded);
+            _shellCells.Clear();
+            _volumeIntegrator.SetShellCells(_shellCells.GpuPos, _shellCells.GpuNrm, 0);
             _shellTracker.Reset();
-            if (uploaded > 0)
-            {
-                Logger.Info(
-                    $"[RoomScanner] Shell cells: total={_shellCells.CellCount} uploaded={uploaded} " +
-                    $"excluded={_shellCells.ExcludedCount} cell={_shellCells.CellSize:F2}m " +
-                    $"surfaces={_shellCells.SurfaceCount} dropped={_shellCells.DroppedSurfaces}");
-            }
         }
 
         void OnShellResult(uint[] result, int count, int generation)
@@ -2006,11 +1961,11 @@ namespace Genesis.RoomScan
                 return;
 
             if (_bodyRig == null)
-                _bodyRig = FindAnyObjectByType<OVRCameraRig>();
+                _bodyRig = FindAnyObjectByType<XROrigin>();
 
             var rig = _bodyRig;
-            if (rig != null && rig.centerEyeAnchor != null)
-                _volumeIntegrator.HeadAnchor = rig.centerEyeAnchor;
+            if (rig != null && rig.Camera != null)
+                _volumeIntegrator.HeadAnchor = rig.Camera.transform;
             else if (_volumeIntegrator.HeadAnchor == null && Camera.main != null)
                 _volumeIntegrator.HeadAnchor = Camera.main.transform;
 
@@ -2019,28 +1974,69 @@ namespace Genesis.RoomScan
             _volumeIntegrator.RightHandAnchor = PickWrist(rig, left: false);
         }
 
-        Transform PickWrist(OVRCameraRig rig, bool left)
+        /// <summary>
+        /// Returns a transform tracking the given hand's controller, or the
+        /// tracked hand itself when no controller is held, or null when that
+        /// side is not tracked at all.
+        ///
+        /// The transform is owned by this scanner and driven from the XR device
+        /// pose, so it does not depend on any particular rig prefab layout.
+        /// </summary>
+        Transform PickWrist(XROrigin rig, bool left)
         {
-            var controller = left ? OVRInput.Controller.LTouch : OVRInput.Controller.RTouch;
-            if (OVRInput.GetControllerPositionTracked(controller))
+            if (!TryGetHandDevice(left, out var device)) return null;
+
+            if (!device.TryGetFeatureValue(UnityEngine.XR.CommonUsages.devicePosition, out var localPos) ||
+                !device.TryGetFeatureValue(UnityEngine.XR.CommonUsages.deviceRotation, out var localRot))
+                return null;
+
+            // Device poses are in tracking space; the rig maps them to world.
+            var origin = rig.transform;
+            var wrist = left ? _leftWrist : _rightWrist;
+            if (wrist == null)
             {
-                var onCtrl = left ? rig.leftHandOnControllerAnchor : rig.rightHandOnControllerAnchor;
-                if (onCtrl != null) return onCtrl;
-                return left ? rig.leftControllerAnchor : rig.rightControllerAnchor;
+                wrist = new GameObject(left ? "ScanWristLeft" : "ScanWristRight").transform;
+                wrist.SetParent(origin, false);
+                if (left) _leftWrist = wrist;
+                else _rightWrist = wrist;
             }
 
-            var handAnchor = left ? rig.leftHandAnchor : rig.rightHandAnchor;
-            if (handAnchor == null) return null;
-            var hand = left ? _leftOvrHand : _rightOvrHand;
-            if (hand == null)
-            {
-                hand = handAnchor.GetComponentInChildren<OVRHand>();
-                if (left) _leftOvrHand = hand;
-                else _rightOvrHand = hand;
-            }
-            if (hand != null && !hand.IsTracked) return null;
-            return handAnchor;
+            wrist.SetPositionAndRotation(
+                origin.TransformPoint(localPos),
+                origin.rotation * localRot);
+            return wrist;
         }
+
+        /// <summary>
+        /// Finds the controller for the given side, falling back to a tracked
+        /// hand. Only returns devices that are currently tracked.
+        /// </summary>
+        static bool TryGetHandDevice(bool left, out UnityEngine.XR.InputDevice device)
+        {
+            var side = left ? UnityEngine.XR.InputDeviceCharacteristics.Left : UnityEngine.XR.InputDeviceCharacteristics.Right;
+
+            s_DeviceScratch.Clear();
+            UnityEngine.XR.InputDevices.GetDevicesWithCharacteristics(
+                UnityEngine.XR.InputDeviceCharacteristics.HeldInHand | UnityEngine.XR.InputDeviceCharacteristics.Controller | side,
+                s_DeviceScratch);
+            if (s_DeviceScratch.Count == 0)
+                UnityEngine.XR.InputDevices.GetDevicesWithCharacteristics(
+                    UnityEngine.XR.InputDeviceCharacteristics.HandTracking | side, s_DeviceScratch);
+
+            foreach (var d in s_DeviceScratch)
+            {
+                if (d.TryGetFeatureValue(UnityEngine.XR.CommonUsages.isTracked, out bool tracked) && tracked)
+                {
+                    device = d;
+                    return true;
+                }
+            }
+
+            device = default;
+            return false;
+        }
+
+        static readonly List<UnityEngine.XR.InputDevice> s_DeviceScratch = new();
 
         // ─────────────────────────────────────────────────────────────
         //  Coverage metrics & progress

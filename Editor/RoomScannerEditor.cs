@@ -2,7 +2,6 @@ using System;
 using System.IO;
 using System.Linq;
 using Genesis.RoomScan.UI;
-using Meta.XR;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.UIElements;
@@ -18,7 +17,7 @@ namespace Genesis.RoomScan.Editor
     {
         static readonly (string label, Type type, Type[] extraDeps, bool triggerXAtlasBuild)[] ModuleOptions =
         {
-            ("Passthrough Camera", typeof(PassthroughCameraProvider), new[] { typeof(PassthroughCameraAccess) }, false),
+            ("Passthrough Camera", typeof(PassthroughCameraProvider), new[] { typeof(UnityEngine.XR.ARFoundation.ARCameraManager) }, false),
             ("Triplanar Cache", typeof(TriplanarCache), null, false),
             ("Texture Refinement", typeof(TextureRefinement), null, true),
             ("Input Handler", typeof(RoomScanInputHandler), null, false),

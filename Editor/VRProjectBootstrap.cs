@@ -52,14 +52,18 @@ namespace Genesis.RoomScan.Editor
         // OpenXR feature ids — kept here so we don't take a hard reference on
         // internal types just to read constants. Mismatch with the SDK is
         // caught at audit-time by FeatureHelpers returning null.
-        const string FID_META_XR             = "com.meta.openxr.feature.metaxr";
-        const string FID_META_FOVEATION      = "com.meta.openxr.feature.foveation";
+        const string FID_META_QUEST          = "com.unity.openxr.feature.metaquest";
+        const string FID_FOVEATION           = "com.unity.openxr.feature.foveatedrendering";
+        const string FID_HAND_TRACKING       = "com.unity.openxr.feature.input.handtrackingsubsystem";
         const string FID_OCULUS_TOUCH        = "com.unity.openxr.feature.input.oculustouch";
         const string FID_QUEST_TOUCH_PLUS    = "com.unity.openxr.feature.input.metaquestplus";
         const string FID_QUEST_TOUCH_PRO     = "com.unity.openxr.feature.input.metaquestpro";
         const string FID_AR_CAMERA           = "com.unity.openxr.feature.arfoundation-meta-camera";
         const string FID_AR_OCCLUSION        = "com.unity.openxr.feature.arfoundation-meta-occlusion";
         const string FID_AR_SESSION          = "com.unity.openxr.feature.arfoundation-meta-session";
+        const string FID_AR_ANCHOR           = "com.unity.openxr.feature.arfoundation-meta-anchor";
+        const string FID_AR_PLANE            = "com.unity.openxr.feature.arfoundation-meta-plane";
+        const string FID_AR_BOUNDING_BOXES   = "com.unity.openxr.feature.arfoundation-meta-bounding-boxes";
 
         const string OPENXR_LOADER_TYPE = "UnityEngine.XR.OpenXR.OpenXRLoader";
 
@@ -142,21 +146,6 @@ namespace Genesis.RoomScan.Editor
                 }
             }
 
-            // Meta's own catch-all sweep — best handled last so its tasks see
-            // the loaders / features we just enabled.
-            if (includeUpTo == CheckSeverity.Recommended)
-            {
-                try
-                {
-                    await OVRProjectSetup.FixAllAsync(BuildTargetGroup.Android);
-                    Debug.Log("[VR Bootstrap] Meta XR Project Setup Tool: ran FixAllAsync(Android).");
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogWarning($"[VR Bootstrap] OVRProjectSetup.FixAllAsync raised {ex.GetType().Name}: {ex.Message}");
-                }
-            }
-
             AssetDatabase.SaveAssets();
             Debug.Log($"[VR Bootstrap] Done. fixed={fixed_}, skipped(no-fix)={skipped}.");
         }
@@ -192,9 +181,9 @@ namespace Genesis.RoomScan.Editor
                     label: "Android: OpenXR loader assigned"),
 
                 MakeOpenXRFeatureCheck(BuildTargetGroup.Android, CheckSeverity.Outstanding,
-                    id: "android.openxr.metaxr",
-                    label: "Android: Meta XR feature enabled",
-                    featureId: FID_META_XR),
+                    id: "android.openxr.metaquest",
+                    label: "Android: Meta Quest support feature enabled",
+                    featureId: FID_META_QUEST),
 
                 new VRCheck {
                     Id = "android.openxr.touchprofile",
@@ -246,8 +235,8 @@ namespace Genesis.RoomScan.Editor
 
                 MakeOpenXRFeatureCheck(BuildTargetGroup.Android, CheckSeverity.Recommended,
                     id: "android.openxr.foveation",
-                    label: "Android: Meta XR Foveation enabled",
-                    featureId: FID_META_FOVEATION),
+                    label: "Android: Foveated Rendering enabled",
+                    featureId: FID_FOVEATION),
 
                 MakeOpenXRFeatureCheck(BuildTargetGroup.Android, CheckSeverity.Recommended,
                     id: "android.openxr.passthrough",
@@ -264,93 +253,30 @@ namespace Genesis.RoomScan.Editor
                     label: "Android: Meta Quest Occlusion feature enabled",
                     featureId: FID_AR_OCCLUSION),
 
-                new VRCheck {
-                    Id = "ovr.projectconfig.quest3",
-                    Label = "OVRProjectConfig: target devices include Quest3 (and Quest3S)",
-                    Severity = CheckSeverity.Recommended,
-                    Group = BuildTargetGroup.Android,
-                    CurrentValue = () => {
-                        var c = OVRProjectConfig.CachedProjectConfig;
-                        return c == null ? "(no config)" :
-                            string.Join(",", c.targetDeviceTypes.Select(t => t.ToString()));
-                    },
-                    TargetValue = "include Quest3, Quest3S",
-                    IsOk = () => {
-                        var c = OVRProjectConfig.CachedProjectConfig;
-                        return c != null
-                            && c.targetDeviceTypes.Contains(OVRProjectConfig.DeviceType.Quest3)
-                            && c.targetDeviceTypes.Contains(OVRProjectConfig.DeviceType.Quest3S);
-                    },
-                    Fix = () => {
-                        var c = OVRProjectConfig.CachedProjectConfig;
-                        if (c == null) return;
-                        if (!c.targetDeviceTypes.Contains(OVRProjectConfig.DeviceType.Quest3))
-                            c.targetDeviceTypes.Add(OVRProjectConfig.DeviceType.Quest3);
-                        if (!c.targetDeviceTypes.Contains(OVRProjectConfig.DeviceType.Quest3S))
-                            c.targetDeviceTypes.Add(OVRProjectConfig.DeviceType.Quest3S);
-                        OVRProjectConfig.CommitProjectConfig(c);
-                    },
-                },
+                // Capabilities that OVRProjectConfig used to gate (anchors,
+                // scene/planes, passthrough, hand tracking) are OpenXR features
+                // now; device targeting is handled by the Meta OpenXR feature
+                // set rather than a per-device list.
+                MakeOpenXRFeatureCheck(BuildTargetGroup.Android, CheckSeverity.Recommended,
+                    id: "android.openxr.handtracking",
+                    label: "Android: Hand Tracking subsystem enabled",
+                    featureId: FID_HAND_TRACKING),
 
-                MakeOvrConfigEnumCheck(
-                    id: "ovr.projectconfig.handtracking",
-                    label: "OVRProjectConfig: hand tracking enabled (controllers + hands)",
-                    read: c => c.handTrackingSupport.ToString(),
-                    isOk: c => c.handTrackingSupport != OVRProjectConfig.HandTrackingSupport.ControllersOnly,
-                    fix:  c => c.handTrackingSupport = OVRProjectConfig.HandTrackingSupport.ControllersAndHands,
-                    target: ">= ControllersAndHands"),
+                MakeOpenXRFeatureCheck(BuildTargetGroup.Android, CheckSeverity.Recommended,
+                    id: "android.openxr.anchor",
+                    label: "Android: Meta Quest Anchor feature enabled (spatial anchors)",
+                    featureId: FID_AR_ANCHOR),
 
-                MakeOvrConfigEnumCheck(
-                    id: "ovr.projectconfig.anchors",
-                    label: "OVRProjectConfig: spatial anchor support enabled",
-                    read: c => c.anchorSupport.ToString(),
-                    isOk: c => c.anchorSupport != OVRProjectConfig.AnchorSupport.Disabled,
-                    fix:  c => c.anchorSupport = OVRProjectConfig.AnchorSupport.Enabled,
-                    target: "Enabled"),
+                MakeOpenXRFeatureCheck(BuildTargetGroup.Android, CheckSeverity.Recommended,
+                    id: "android.openxr.plane",
+                    label: "Android: Meta Quest Plane feature enabled (scene surfaces)",
+                    featureId: FID_AR_PLANE),
 
-                MakeOvrConfigEnumCheck(
-                    id: "ovr.projectconfig.scene",
-                    label: "OVRProjectConfig: scene support",
-                    read: c => c.sceneSupport.ToString(),
-                    isOk: c => c.sceneSupport >= OVRProjectConfig.FeatureSupport.Supported,
-                    fix:  c => c.sceneSupport = OVRProjectConfig.FeatureSupport.Supported,
-                    target: ">= Supported"),
+                MakeOpenXRFeatureCheck(BuildTargetGroup.Android, CheckSeverity.Recommended,
+                    id: "android.openxr.boundingboxes",
+                    label: "Android: Meta Quest Bounding Boxes feature enabled (scene volumes)",
+                    featureId: FID_AR_BOUNDING_BOXES),
 
-                MakeOvrConfigEnumCheck(
-                    id: "ovr.projectconfig.passthrough",
-                    label: "OVRProjectConfig: insight passthrough support",
-                    read: c => c.insightPassthroughSupport.ToString(),
-                    isOk: c => c.insightPassthroughSupport >= OVRProjectConfig.FeatureSupport.Supported,
-                    fix:  c => c.insightPassthroughSupport = OVRProjectConfig.FeatureSupport.Supported,
-                    target: ">= Supported"),
-
-                new VRCheck {
-                    Id = "meta.runtime.settings.preloaded",
-                    Label = "Meta XR runtime settings asset exists",
-                    Severity = CheckSeverity.Recommended,
-                    Group = BuildTargetGroup.Android,
-                    CurrentValue = () => OVRRuntimeSettings.GetRuntimeSettings() != null
-                        ? "exists" : "missing",
-                    TargetValue = "exists",
-                    IsOk = () => OVRRuntimeSettings.GetRuntimeSettings() != null,
-                    Fix = () => {
-                        // GetRuntimeSettings auto-creates Resources/OculusRuntimeSettings.asset
-                        // on the editor side via LoadAsset's create-fallback path.
-                        var s = OVRRuntimeSettings.GetRuntimeSettings();
-                        if (s != null) EditorUtility.SetDirty(s);
-                    },
-                },
-
-                new VRCheck {
-                    Id = "meta.setuptool.fixall",
-                    Label = "Meta XR Project Setup Tool: run Fix All Outstanding (catch-all)",
-                    Severity = CheckSeverity.Recommended,
-                    Group = BuildTargetGroup.Android,
-                    CurrentValue = () => "(synthetic — always shown)",
-                    TargetValue = "FixAllAsync(Android) ran in this session",
-                    IsOk = () => false, // synthetic catch-all; intentionally always re-runnable
-                    Fix = null,         // invoked by FixAllAsync orchestrator after per-check loop
-                },
             };
 
             return list;
@@ -631,37 +557,5 @@ namespace Genesis.RoomScan.Editor
 
         #endregion
 
-        // -- Region: OVRProjectConfig ------------------------------------
-        #region OVRProjectConfig
-
-        static VRCheck MakeOvrConfigEnumCheck(
-            string id, string label,
-            Func<OVRProjectConfig, string> read,
-            Func<OVRProjectConfig, bool> isOk,
-            Action<OVRProjectConfig> fix,
-            string target) => new()
-        {
-            Id = id,
-            Label = label,
-            Severity = CheckSeverity.Recommended,
-            Group = BuildTargetGroup.Android,
-            CurrentValue = () => {
-                var c = OVRProjectConfig.CachedProjectConfig;
-                return c == null ? "(no config)" : read(c);
-            },
-            TargetValue = target,
-            IsOk = () => {
-                var c = OVRProjectConfig.CachedProjectConfig;
-                return c != null && isOk(c);
-            },
-            Fix = () => {
-                var c = OVRProjectConfig.CachedProjectConfig;
-                if (c == null) return;
-                fix(c);
-                OVRProjectConfig.CommitProjectConfig(c);
-            },
-        };
-
-        #endregion
     }
 }

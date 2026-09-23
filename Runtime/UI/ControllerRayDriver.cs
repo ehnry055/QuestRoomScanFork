@@ -1,17 +1,29 @@
+using System.Collections.Generic;
+using Unity.XR.CoreUtils;
 using UnityEngine;
-using UnityEngine.EventSystems;
 using UnityEngine.UIElements;
+using UnityEngine.XR;
 
 namespace Genesis.RoomScan.UI
 {
     /// <summary>
-    /// Picks the active VR controller, keeps <see cref="OVRInputModule.rayTransform"/>
-    /// pointing along the controller ray, and draws a laser + cursor dot.
-    /// Place on the same GameObject as the <c>EventSystem</c> / <c>OVRInputModule</c>.
+    /// Picks the active VR controller (or tracked hand), keeps a ray transform
+    /// pointing along its aim pose, and draws a laser + cursor dot.
+    /// Place on the EventSystem GameObject.
+    ///
+    /// The live ray is published through <see cref="Active"/> so
+    /// <see cref="VRDocumentRaycaster"/> can raycast along it.
     /// </summary>
-    [RequireComponent(typeof(OVRInputModule))]
     public class ControllerRayDriver : MonoBehaviour
     {
+        /// <summary>Most recently enabled driver, or null. Used by the UI raycaster.</summary>
+        public static ControllerRayDriver Active { get; private set; }
+
+        // OpenXR exposes the aim ("pointer") pose separately from the grip pose.
+        // These are the standard custom usages for it; not in CommonUsages.
+        private static readonly InputFeatureUsage<Vector3> k_PointerPosition = new("PointerPosition");
+        private static readonly InputFeatureUsage<Quaternion> k_PointerRotation = new("PointerRotation");
+
         [Header("Ray")]
         [SerializeField, Tooltip("Forward offset from controller origin (meters)")]
         private float rayStartOffset = 0.05f;
@@ -29,36 +41,58 @@ namespace Genesis.RoomScan.UI
         [Header("Rendering")]
         [SerializeField] internal Shader overlayShader;
 
-        private OVRInputModule _inputModule;
         private Transform _rayHelper;
         private LineRenderer _line;
         private GameObject _cursor;
         private MeshRenderer _cursorRenderer;
-        private OVRInput.Controller _activeController = OVRInput.Controller.RTouch;
+        private XROrigin _origin;
 
-        private static OVRPlugin.HandState _handState = new();
+        private readonly List<InputDevice> _scratch = new();
+        private InputDevice _activeDevice;
+        private bool _hasRay;
 
-        // Layer mask matching the debug menu's panel collider layer
-        private int _uiLayerMask;
+        /// <summary>Transform following the active controller's aim pose.</summary>
+        public Transform RayTransform => _rayHelper;
+
+        /// <summary>
+        /// Current world-space aim ray. <paramref name="ray"/> is only valid when
+        /// this returns true (no tracked device yet, or tracking lost).
+        /// </summary>
+        public bool TryGetRay(out Ray ray)
+        {
+            if (!_hasRay || _rayHelper == null)
+            {
+                ray = default;
+                return false;
+            }
+            ray = new Ray(_rayHelper.position, _rayHelper.forward);
+            return true;
+        }
+
+        /// <summary>Max distance the ray interacts over, in meters.</summary>
+        public float MaxLength => maxLength;
 
         private void Awake()
         {
-            _inputModule = GetComponent<OVRInputModule>();
-
             _rayHelper = new GameObject("ControllerRayHelper").transform;
             _rayHelper.SetParent(transform, false);
-            _inputModule.rayTransform = _rayHelper;
-            _inputModule.joyPadClickButton = OVRInput.Button.PrimaryIndexTrigger;
 
-            _uiLayerMask = LayerMask.GetMask("Default", "UI");
+            _origin = FindAnyObjectByType<XROrigin>();
 
             SetupLineRenderer();
             SetupCursor();
         }
 
+        private void OnEnable() => Active = this;
+
+        private void OnDisable()
+        {
+            if (Active == this) Active = null;
+        }
+
         private void Update()
         {
-            _activeController = ChooseBestController(_activeController);
+            _activeDevice = ChooseBestDevice(_activeDevice);
             UpdateRayOrigin();
         }
 
@@ -73,57 +107,92 @@ namespace Genesis.RoomScan.UI
             if (_cursor != null) Destroy(_cursor);
         }
 
-        // ─── Controller Selection (adapted from Meta ImmersiveDebugger) ───
+        // ─── Device Selection ───
 
-        private static OVRInput.Controller ChooseBestController(OVRInput.Controller previous)
+        /// <summary>
+        /// Keeps the current device while it stays valid, otherwise prefers the
+        /// right hand, then the left. Switches to whichever device the user is
+        /// actively pressing, mirroring the old controller-swap behaviour.
+        /// </summary>
+        private InputDevice ChooseBestDevice(InputDevice previous)
         {
-            var left = OVRInput.GetActiveControllerForHand(OVRInput.Handedness.LeftHanded);
-            var right = OVRInput.GetActiveControllerForHand(OVRInput.Handedness.RightHanded);
+            var right = FindDevice(InputDeviceCharacteristics.Right);
+            var left = FindDevice(InputDeviceCharacteristics.Left);
 
-            var ctrl = previous;
-            if (ctrl == OVRInput.Controller.None || (ctrl != left && ctrl != right))
-            {
-                ctrl = right != OVRInput.Controller.None ? right
-                     : left != OVRInput.Controller.None ? left
-                     : OVRInput.GetDominantHand() == OVRInput.Handedness.LeftHanded ? left : right;
-            }
+            var device = previous;
+            if (!device.isValid)
+                device = right.isValid ? right : left;
 
-            if (ctrl != left && OVRInput.Get(OVRInput.Button.Any, left)) ctrl = left;
-            if (ctrl != right && OVRInput.Get(OVRInput.Button.Any, right)) ctrl = right;
-            if (ctrl == OVRInput.Controller.None) ctrl = OVRInput.Controller.RTouch;
+            // Hand over to the other device as soon as it is used.
+            if (right.isValid && !Same(device, right) && IsBeingUsed(right)) device = right;
+            else if (left.isValid && !Same(device, left) && IsBeingUsed(left)) device = left;
 
-            return ctrl;
+            return device;
+        }
+
+        private static bool Same(InputDevice a, InputDevice b) => a.isValid && b.isValid && a == b;
+
+        private static bool IsBeingUsed(InputDevice d)
+        {
+            return (d.TryGetFeatureValue(CommonUsages.triggerButton, out bool t) && t)
+                || (d.TryGetFeatureValue(CommonUsages.gripButton, out bool g) && g)
+                || (d.TryGetFeatureValue(CommonUsages.primaryButton, out bool p) && p)
+                || (d.TryGetFeatureValue(CommonUsages.secondaryButton, out bool s) && s);
+        }
+
+        private InputDevice FindDevice(InputDeviceCharacteristics hand)
+        {
+            // Controllers first; fall back to a tracked hand on the same side.
+            _scratch.Clear();
+            InputDevices.GetDevicesWithCharacteristics(
+                InputDeviceCharacteristics.HeldInHand | InputDeviceCharacteristics.Controller | hand,
+                _scratch);
+            if (_scratch.Count > 0) return _scratch[0];
+
+            _scratch.Clear();
+            InputDevices.GetDevicesWithCharacteristics(
+                InputDeviceCharacteristics.HandTracking | hand, _scratch);
+            return _scratch.Count > 0 ? _scratch[0] : default;
         }
 
         // ─── Ray Transform ───
 
         private void UpdateRayOrigin()
         {
-            bool isHand = _activeController is OVRInput.Controller.LHand or OVRInput.Controller.RHand;
+            _hasRay = false;
+            if (!_activeDevice.isValid) return;
 
-            Vector3 localPos;
-            Quaternion localRot;
-
-            if (isHand)
+            // Prefer the aim pose; fall back to the grip pose on runtimes that
+            // do not surface a separate pointer pose (e.g. some hand profiles).
+            if (!_activeDevice.TryGetFeatureValue(k_PointerPosition, out Vector3 localPos) ||
+                !_activeDevice.TryGetFeatureValue(k_PointerRotation, out Quaternion localRot))
             {
-                var hand = _activeController == OVRInput.Controller.LHand
-                    ? OVRPlugin.Hand.HandLeft : OVRPlugin.Hand.HandRight;
-                OVRPlugin.GetHandState(OVRPlugin.Step.Render, hand, ref _handState);
-                localPos = _handState.PointerPose.Position.FromFlippedZVector3f();
-                localRot = _handState.PointerPose.Orientation.FromFlippedZQuatf();
+                if (!_activeDevice.TryGetFeatureValue(CommonUsages.devicePosition, out localPos) ||
+                    !_activeDevice.TryGetFeatureValue(CommonUsages.deviceRotation, out localRot))
+                    return;
+            }
+
+            // Device poses are in tracking space; lift them into world space
+            // through the rig. Without a rig they are already world-space.
+            var rig = _origin != null ? _origin.transform : null;
+            if (rig == null)
+            {
+                _origin = FindAnyObjectByType<XROrigin>();
+                rig = _origin != null ? _origin.transform : null;
+            }
+
+            if (rig != null)
+            {
+                _rayHelper.SetPositionAndRotation(
+                    rig.TransformPoint(localPos),
+                    rig.rotation * localRot);
             }
             else
             {
-                localPos = OVRInput.GetLocalControllerPosition(_activeController);
-                localRot = OVRInput.GetLocalControllerRotation(_activeController);
+                _rayHelper.SetPositionAndRotation(localPos, localRot);
             }
 
-            var pose = new OVRPose { position = localPos, orientation = localRot };
-
-            var cam = Camera.main;
-            if (cam != null) pose = pose.ToWorldSpacePose(cam);
-
-            _rayHelper.SetPositionAndRotation(pose.position, pose.orientation);
+            _hasRay = true;
         }
 
         // ─── Laser Visual ───
@@ -163,6 +232,15 @@ namespace Genesis.RoomScan.UI
         private void DrawLaser()
         {
             if (_rayHelper == null || _line == null) return;
+
+            // Hide the beam entirely while no device is tracked.
+            if (!_hasRay)
+            {
+                _line.enabled = false;
+                if (_cursor != null) _cursor.SetActive(false);
+                return;
+            }
+            _line.enabled = true;
 
             var origin = _rayHelper.position;
             var dir = _rayHelper.forward;

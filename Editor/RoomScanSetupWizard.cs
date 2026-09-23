@@ -3,14 +3,15 @@ using System.IO;
 using System.Linq;
 using System.Xml.Linq;
 using Genesis.RoomScan.UI;
-using Meta.XR;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.Rendering.Universal;
 using UnityEngine.UIElements;
+using UnityEngine.InputSystem;
 using UnityEngine.XR.ARFoundation;
+using UnityEngine.XR.Interaction.Toolkit.UI;
 using Unity.XR.CoreUtils;
 
 namespace Genesis.RoomScan.Editor
@@ -31,7 +32,7 @@ namespace Genesis.RoomScan.Editor
         MeshExtractor _meshExtractor;
         RoomScanner _roomScanner;
         PassthroughCameraProvider _cameraProvider;
-        PassthroughCameraAccess _pcaComponent;
+        ARCameraManager _arCameraManager;
         CameraDebugOverlay _cameraDebug;
         DepthDebugOverlay _depthDebug;
         TriplanarCache _triplanarCache;
@@ -42,7 +43,7 @@ namespace Genesis.RoomScan.Editor
         RoomScanInputHandler _inputHandler;
         RoomAnchorManager _roomAnchor;
         EventSystem _eventSystem;
-        OVRInputModule _ovrInputModule;
+        XRUIInputModule _xrInputModule;
         VRDocumentRaycaster _vrRaycaster;
         ControllerRayDriver _rayDriver;
         PanelInputConfiguration _panelInputConfig;
@@ -100,18 +101,13 @@ namespace Genesis.RoomScan.Editor
             var xrOrigin = FindAny<Unity.XR.CoreUtils.XROrigin>();
             if (xrOrigin != null)
                 _cameraRig = xrOrigin.gameObject;
-            if (_cameraRig == null)
-            {
-                var ovrRig = FindComponentByTypeName("OVRCameraRig");
-                if (ovrRig != null) _cameraRig = ovrRig.gameObject;
-            }
 
             _depthCapture = FindAny<DepthCapture>();
             _volumeIntegrator = FindAny<VolumeIntegrator>();
             _meshExtractor = FindAny<MeshExtractor>();
             _roomScanner = FindAny<RoomScanner>();
             _cameraProvider = FindAny<PassthroughCameraProvider>();
-            _pcaComponent = FindAny<PassthroughCameraAccess>();
+            _arCameraManager = FindAny<ARCameraManager>();
             _cameraDebug = FindAny<CameraDebugOverlay>();
             _depthDebug = FindAny<DepthDebugOverlay>();
             _triplanarCache = FindAny<TriplanarCache>();
@@ -122,7 +118,7 @@ namespace Genesis.RoomScan.Editor
             _inputHandler = FindAny<RoomScanInputHandler>();
             _roomAnchor = FindAny<RoomAnchorManager>();
             _eventSystem = FindAny<EventSystem>();
-            _ovrInputModule = FindAny<OVRInputModule>();
+            _xrInputModule = FindAny<XRUIInputModule>();
             _vrRaycaster = FindAny<VRDocumentRaycaster>();
             _rayDriver = FindAny<ControllerRayDriver>();
             _panelInputConfig = FindAny<PanelInputConfiguration>();
@@ -153,7 +149,6 @@ namespace Genesis.RoomScan.Editor
 
             RefreshURPState();
 
-            RefreshBuildingBlocksState();
             _boundarylessManifest = ManifestHasAllQuestVREntries();
             _cleartextAllowed = ManifestHasCleartextTraffic();
             _insecureHttpAllowed = PlayerSettings.insecureHttpOption != InsecureHttpOption.NotAllowed;
@@ -233,7 +228,7 @@ namespace Genesis.RoomScan.Editor
                 : "URP pipeline asset wired";
             StatusRow(urpLabel, _urpConfigured);
             StatusRow("ARSession", _arSession != null);
-            StatusRow("Camera Rig (OVRCameraRig / XROrigin)", _cameraRig != null);
+            StatusRow("Camera Rig (XROrigin)", _cameraRig != null);
             StatusRow("AROcclusionManager", _arOcclusion != null);
 
             if (!_urpConfigured)
@@ -346,12 +341,90 @@ namespace Genesis.RoomScan.Editor
                 occl.enabled = false;
                 EditorUtility.SetDirty(occl);
             }
-            foreach (var pca in Object.FindObjectsByType<PassthroughCameraAccess>(FindObjectsInactive.Include))
+            foreach (var cam in Object.FindObjectsByType<ARCameraManager>(FindObjectsInactive.Include))
             {
-                if (pca == null || !pca.enabled) continue;
-                pca.enabled = false;
-                EditorUtility.SetDirty(pca);
+                if (cam == null || !cam.enabled) continue;
+                cam.enabled = false;
+                EditorUtility.SetDirty(cam);
             }
+        }
+
+        /// <summary>
+        /// Ensures the XR Origin's camera has an <see cref="ARCameraManager"/>,
+        /// which is where ARFoundation expects it. Added disabled so the
+        /// headset cameras are not opened until a scan starts.
+        /// </summary>
+        static void EnsureARCameraManager()
+        {
+            if (Object.FindAnyObjectByType<ARCameraManager>(FindObjectsInactive.Include) != null)
+                return;
+
+            var origin = Object.FindAnyObjectByType<Unity.XR.CoreUtils.XROrigin>(FindObjectsInactive.Include);
+            var cam = origin != null ? origin.Camera : Camera.main;
+            if (cam == null)
+            {
+                Debug.LogWarning("[RoomScan Setup] No XR Origin camera found — " +
+                                 "cannot add ARCameraManager for passthrough frames.");
+                return;
+            }
+
+            var mgr = Undo.AddComponent<ARCameraManager>(cam.gameObject);
+            mgr.enabled = false;
+        }
+
+        /// <summary>
+        /// Ensures the scene has an XR Origin rig with a tracked camera, plus
+        /// an <see cref="ARCameraManager"/> on it. This replaces the Meta XR
+        /// Building Blocks install: under OpenXR the rig is plain XR Origin,
+        /// and passthrough comes from the Meta OpenXR feature set rather than
+        /// an underlay component.
+        /// </summary>
+        void EnsureXRRig()
+        {
+            var origin = Object.FindAnyObjectByType<Unity.XR.CoreUtils.XROrigin>(FindObjectsInactive.Include);
+            if (origin == null)
+            {
+                var go = new GameObject("XR Origin");
+                Undo.RegisterCreatedObjectUndo(go, "Create XR Origin");
+                origin = Undo.AddComponent<Unity.XR.CoreUtils.XROrigin>(go);
+
+                var offset = new GameObject("Camera Offset");
+                Undo.RegisterCreatedObjectUndo(offset, "Create Camera Offset");
+                offset.transform.SetParent(go.transform, false);
+                origin.CameraFloorOffsetObject = offset;
+
+                var camGo = new GameObject("Main Camera");
+                Undo.RegisterCreatedObjectUndo(camGo, "Create XR Camera");
+                camGo.transform.SetParent(offset.transform, false);
+                camGo.tag = "MainCamera";
+
+                var cam = Undo.AddComponent<Camera>(camGo);
+                cam.clearFlags = CameraClearFlags.SolidColor;
+                // Transparent clear so passthrough shows through.
+                cam.backgroundColor = new Color(0f, 0f, 0f, 0f);
+                cam.nearClipPlane = 0.01f;
+                // Drive the camera from the HMD pose. Bindings are set
+                // explicitly so the rig tracks without depending on a
+                // project-specific input action asset.
+                var tpd = Undo.AddComponent<UnityEngine.InputSystem.XR.TrackedPoseDriver>(camGo);
+                tpd.positionInput = new InputActionProperty(
+                    new InputAction("Position", binding: "<XRHMD>/centerEyePosition",
+                                    expectedControlType: "Vector3"));
+                tpd.rotationInput = new InputActionProperty(
+                    new InputAction("Rotation", binding: "<XRHMD>/centerEyeRotation",
+                                    expectedControlType: "Quaternion"));
+                tpd.trackingStateInput = new InputActionProperty(
+                    new InputAction("Tracking State", binding: "<XRHMD>/trackingState",
+                                    expectedControlType: "Integer"));
+                origin.Camera = cam;
+
+                // Floor-relative so the rig matches the user's real floor.
+                origin.RequestedTrackingOriginMode =
+                    Unity.XR.CoreUtils.XROrigin.TrackingOriginMode.Floor;
+            }
+
+            EnsureARCameraManager();
+            MarkDirty();
         }
 
         // -- Project Settings ---------------------------------------------
@@ -715,20 +788,7 @@ namespace Genesis.RoomScan.Editor
             StatusRow("VolumeIntegrator", _volumeIntegrator != null);
             StatusRow("MeshExtractor", _meshExtractor != null);
             StatusRow("RoomScanPersistence", _persistence != null);
-            StatusRow("RoomAnchorManager (MRUK + SpatialAnchor)", _roomAnchor != null);
-
-            var ovrConfig = OVRProjectConfig.CachedProjectConfig;
-            bool anchorSupportOk = ovrConfig != null
-                && ovrConfig.anchorSupport != OVRProjectConfig.AnchorSupport.Disabled;
-            StatusRow("OVRProjectConfig anchor support", anchorSupportOk);
-            if (!anchorSupportOk && ovrConfig != null)
-            {
-                if (GUILayout.Button("Fix: Enable Spatial Anchor Support"))
-                {
-                    ovrConfig.anchorSupport = OVRProjectConfig.AnchorSupport.Enabled;
-                    OVRProjectConfig.CommitProjectConfig(ovrConfig);
-                }
-            }
+            StatusRow("RoomAnchorManager (AR anchors)", _roomAnchor != null);
 
             bool coreMissing = _roomScanner == null || _depthCapture == null ||
                                _volumeIntegrator == null || _meshExtractor == null ||
@@ -752,7 +812,7 @@ namespace Genesis.RoomScan.Editor
                 MessageType.Info);
 
             StatusRowOptional("PassthroughCameraProvider", _cameraProvider != null);
-            StatusRowOptional("PassthroughCameraAccess", _pcaComponent != null);
+            StatusRowOptional("ARCameraManager", _arCameraManager != null);
             StatusRowOptional("TriplanarCache", _triplanarCache != null);
             StatusRowOptional("KeyframeCollector", _keyframeCollector != null);
             DrawGSplatOptionalStatus();
@@ -872,15 +932,11 @@ namespace Genesis.RoomScan.Editor
             if (root.GetComponent<RoomScanner>() == null)
                 Undo.AddComponent<RoomScanner>(root);
 
-            // PassthroughCameraAccess isn't pulled in by RequireComponent.
-            // It will spam "No active XRSubsystem" / NRE errors in Editor
-            // play mode without an XR loader; that's expected and can't be
-            // fixed from outside Meta's package — build to device to test.
-            if (root.GetComponent<PassthroughCameraAccess>() == null)
-            {
-                var pca = Undo.AddComponent<PassthroughCameraAccess>(root);
-                pca.enabled = false;
-            }
+            // ARCameraManager must sit on the XR Origin's camera, so it is
+            // not pulled in by RequireComponent on the scanner root. It will
+            // log "no active XRSubsystem" in Editor play mode without an XR
+            // loader; that is expected — build to device to test.
+            EnsureARCameraManager();
             if (root.GetComponent<PassthroughCameraProvider>() == null)
                 Undo.AddComponent<PassthroughCameraProvider>(root);
 
@@ -956,9 +1012,9 @@ namespace Genesis.RoomScan.Editor
                 "One-click \"make this project actually buildable for Quest VR\":\n" +
                 "  \u2022 Switch active build profile to Meta Quest if needed (re-click after the reload)\n" +
                 "  \u2022 URP pipeline + renderer at Assets/Settings/ with Quest-friendly defaults (4x MSAA, no HDR, single shadow cascade)\n" +
-                "  \u2022 VR project prerequisites (XR Plug-in, OpenXR features, OVRProjectConfig \u2014 Outstanding tier)\n" +
+                "  \u2022 VR project prerequisites (XR Plug-in, OpenXR features \u2014 Outstanding tier)\n" +
                 "  \u2022 AndroidManifest: full Quest VR feature/permission set (HEADSET_CAMERA, USE_SCENE, USE_ANCHOR_API, BOUNDARYLESS, etc.) + cleartext HTTP + insecureHttpOption\n" +
-                "  \u2022 Meta XR Building Blocks: OVRCameraRig, Passthrough Underlay, PassthroughCameraAccess\n" +
+                "  \u2022 XR Origin rig, passthrough, and ARCameraManager\n" +
                 "  \u2022 AR Session + AROcclusionManager on the camera rig\n" +
                 "  \u2022 Game-ready scene modules (scan \u2192 refine \u2192 release GPU \u2192 play)\n" +
                 "  \u2022 Shader wiring + xatlas native plugin build (background)\n" +
@@ -966,12 +1022,12 @@ namespace Genesis.RoomScan.Editor
                 MessageType.Info);
 
             // ── Scene-level state ──
-            bool hasPCA = _pcaComponent != null;
+            bool hasCameraManager = _arCameraManager != null;
             bool hasPCAProvider = _cameraProvider != null;
             bool hasRefinement = _textureRefinement != null;
             bool hasRoomUnderstanding = _roomScanner != null && _roomScanner.GetComponent<RoomUnderstanding>() != null;
 
-            StatusRowOptional("PassthroughCameraAccess (camera RGB)", hasPCA);
+            StatusRowOptional("ARCameraManager (camera RGB)", hasCameraManager);
             StatusRowOptional("PassthroughCameraProvider", hasPCAProvider);
             StatusRowOptional("TextureRefinement (atlas baking)", hasRefinement);
             StatusRowOptional("RoomUnderstanding (MRUK bridge)", hasRoomUnderstanding);
@@ -1000,9 +1056,6 @@ namespace Genesis.RoomScan.Editor
                 : (buildTargetIsAndroid ? "Android (plain)" : EditorUserBuildSettings.activeBuildTarget.ToString());
             StatusRowOptional($"Active build profile = Meta Quest (current: {profileLabel})", activeProfileIsMetaQuest);
             StatusRowOptional("URP pipeline asset (Quest defaults)", _urpConfigured);
-            StatusRowOptional("Meta XR Building Blocks (Camera Rig + Passthrough + PCA)", _bbAllPresent);
-            StatusRowOptional("Passthrough scene config (OVRManager + transparent center camera; no startup permission dialog)",
-                              _ovrPassthroughReady);
             StatusRowOptional("AR Session + AROcclusionManager", _arSession != null && _arOcclusion != null);
             StatusRowOptional("AndroidManifest (Quest VR features + permissions + cleartext)",
                               _boundarylessManifest && _cleartextAllowed);
@@ -1027,13 +1080,11 @@ namespace Genesis.RoomScan.Editor
                 EditorGUILayout.EndHorizontal();
             }
 
-            bool sceneMissing   = !hasPCA || !hasPCAProvider || !hasRefinement || !hasRoomUnderstanding
+            bool sceneMissing   = !hasCameraManager || !hasPCAProvider || !hasRefinement || !hasRoomUnderstanding
                                   || _session == null;
             bool projectMissing = !buildTargetIsAndroid
                                   || !activeProfileIsMetaQuest
                                   || !_urpConfigured
-                                  || !_bbAllPresent
-                                  || !_ovrPassthroughReady
                                   || _arSession == null || _arOcclusion == null
                                   || !_boundarylessManifest || !_cleartextAllowed || !_insecureHttpAllowed
                                   || _vrOutstanding.Count > 0
@@ -1079,13 +1130,13 @@ namespace Genesis.RoomScan.Editor
 
             GUILayout.Space(4);
             EditorGUILayout.LabelField("VR Input (for debug menu buttons)", EditorStyles.miniLabel);
-            StatusRowOptional("EventSystem + OVRInputModule", _eventSystem != null && _ovrInputModule != null);
+            StatusRowOptional("EventSystem + XRUIInputModule", _eventSystem != null && _xrInputModule != null);
             StatusRowOptional("VRDocumentRaycaster (UI pointer)", _vrRaycaster != null);
             StatusRowOptional("ControllerRayDriver (laser + cursor)", _rayDriver != null);
             StatusRowOptional("PanelInputConfiguration", _panelInputConfig != null);
 
             bool debugMissing = !hasInput || !hasDebug || !hasCamOverlay || !hasDepthOverlay
-                                || _eventSystem == null || _ovrInputModule == null
+                                || _eventSystem == null || _xrInputModule == null
                                 || _vrRaycaster == null || _rayDriver == null
                                 || _panelInputConfig == null;
             if (debugMissing)
@@ -1129,7 +1180,7 @@ namespace Genesis.RoomScan.Editor
                 EnsureURPSetup();
 
                 EditorUtility.DisplayProgressBar("Game-Ready Setup",
-                    "Fixing VR prerequisites (XR Plug-in, OpenXR, OVRProjectConfig\u2026)", 0.15f);
+                    "Fixing VR prerequisites (XR Plug-in, OpenXR features\u2026)", 0.15f);
                 await VRProjectBootstrap.FixAllAsync(CheckSeverity.Outstanding);
 
                 // EnsureQuestVRManifest is unconditional (and idempotent) on
@@ -1148,14 +1199,11 @@ namespace Genesis.RoomScan.Editor
                     Debug.Log("[RoomScan Setup] Set Player Settings > insecureHttpOption to AlwaysAllowed");
                 }
 
-                // Meta XR Building Blocks: drops in OVRCameraRig +
-                // Passthrough Underlay + PassthroughCameraAccess with
-                // Meta's recommended wiring (TrackingOrigin = FloorLevel,
-                // Underlay layer set up, etc.). Done before AR session
-                // so AROcclusionManager can latch onto the new rig camera.
+                // XR Origin rig + ARCameraManager. Done before AR session so
+                // AROcclusionManager can latch onto the new rig camera.
                 EditorUtility.DisplayProgressBar("Game-Ready Setup",
-                    "Installing Meta XR Building Blocks (Camera Rig + Passthrough)\u2026", 0.60f);
-                await EnsureRequiredBuildingBlocksAsync();
+                    "Setting up XR Origin rig\u2026", 0.60f);
+                EnsureXRRig();
                 Refresh();
 
                 EditorUtility.DisplayProgressBar("Game-Ready Setup",
@@ -1213,11 +1261,7 @@ namespace Genesis.RoomScan.Editor
             // PCA + ARSession + AROcclusionManager will spam errors in
             // Editor play mode without an XR loader; that's expected,
             // build to device.
-            if (UnityEngine.Object.FindAnyObjectByType<PassthroughCameraAccess>(FindObjectsInactive.Include) == null)
-            {
-                var pca = Undo.AddComponent<PassthroughCameraAccess>(root);
-                pca.enabled = false;
-            }
+            EnsureARCameraManager();
             if (root.GetComponent<PassthroughCameraProvider>() == null)
                 Undo.AddComponent<PassthroughCameraProvider>(root);
 
@@ -1393,11 +1437,11 @@ namespace Genesis.RoomScan.Editor
                 es = Undo.AddComponent<EventSystem>(esGo);
             }
 
-            if (es.GetComponent<OVRInputModule>() == null)
+            if (es.GetComponent<XRUIInputModule>() == null)
             {
                 var standalone = es.GetComponent<StandaloneInputModule>();
                 if (standalone != null) Undo.DestroyObjectImmediate(standalone);
-                Undo.AddComponent<OVRInputModule>(es.gameObject);
+                Undo.AddComponent<XRUIInputModule>(es.gameObject);
             }
 
             if (es.GetComponent<PanelInputConfiguration>() == null)
@@ -2093,13 +2137,12 @@ namespace Genesis.RoomScan.Editor
 
                 await VRProjectBootstrap.FixAllAsync(CheckSeverity.Recommended);
 
-                // Camera Rig + Passthrough via Meta XR Building Blocks
-                // — does the right thing whether or not a rig is already
-                // present. Done before AR session so AROcclusionManager
-                // can attach to the rig camera.
+                // XR Origin rig + ARCameraManager — does the right thing
+                // whether or not a rig is already present. Done before AR
+                // session so AROcclusionManager can attach to the rig camera.
                 EditorUtility.DisplayProgressBar("Setup Everything",
-                    "Installing Meta XR Building Blocks (Camera Rig + Passthrough)\u2026", 0.30f);
-                await EnsureRequiredBuildingBlocksAsync();
+                    "Setting up XR Origin rig\u2026", 0.30f);
+                EnsureXRRig();
                 Refresh();
 
                 EditorUtility.DisplayProgressBar("Setup Everything",
@@ -2326,7 +2369,7 @@ namespace Genesis.RoomScan.Editor
             // - Dynamic size mode: panel auto-sizes to the content layout (480×640 from USS)
             // - Pivot = Center: transform position = center of the visible panel
             // - PivotReferenceSize = Layout: pivot calculated from root element layout, not bounding box
-            uiDoc.worldSpaceSizeMode = WorldSpaceSizeMode.Dynamic;
+            uiDoc.worldSpaceSizeMode = UIDocument.WorldSpaceSizeMode.Dynamic;
             uiDoc.pivot = Pivot.Center;
             uiDoc.pivotReferenceSize = PivotReferenceSize.Layout;
 
