@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Threading.Tasks;
 using UnityEngine;
 
@@ -333,12 +334,17 @@ namespace Genesis.RoomScan
 
         /// <summary>
         /// Stops scanning, runs on-device texture refinement (UV unwrap + atlas bake + simplification),
-        /// and saves to a permanent package. When
+        /// and saves to a permanent package through <see cref="SaveAsync"/>: a
+        /// scan already saved with nothing integrated since keeps that package
+        /// (the refined mesh is added to it) instead of getting a second one. When
         /// <see cref="PresentRefinedWhenReady"/> is true (default), also
         /// switches to the refined mesh and releases the live TSDF
         /// (~400-500 MB). When false, the live vertex mesh stays until the
         /// host presents and releases.
         /// Returns a <see cref="ScanResult"/> with the game-ready mesh and atlas.
+        /// Throws <see cref="InvalidOperationException"/> as soon as refinement
+        /// fails (nothing is saved then; <see cref="SaveAsync"/> still can) and
+        /// <see cref="TimeoutException"/> after 5 minutes.
         /// </summary>
         public async Task<ScanResult> FinalizeScanAsync()
         {
@@ -356,17 +362,41 @@ namespace Genesis.RoomScan
                 var tcs = new TaskCompletionSource<bool>();
                 void OnReady(Mesh _, Texture2D __) => tcs.TrySetResult(true);
                 _scanner.RefinedMeshReady += OnReady;
-                _scanner.StartTextureRefinement();
+                try
+                {
+                    _scanner.StartTextureRefinement();
 
-                var timeout = Task.Delay(TimeSpan.FromMinutes(5));
-                var completed = await Task.WhenAny(tcs.Task, timeout);
-                _scanner.RefinedMeshReady -= OnReady;
-
-                if (completed == timeout)
-                    throw new TimeoutException("Texture refinement timed out (5 min)");
+                    // StartTextureRefinement is async void: success arrives as
+                    // RefinedMeshReady (raised before IsRefining clears), failure
+                    // only as IsRefining clearing with no refined texture (the
+                    // error is logged). Watch both, so a failed refinement throws
+                    // now instead of at the timeout.
+                    float deadline = Time.realtimeSinceStartup + 300f;
+                    while (!tcs.Task.IsCompleted)
+                    {
+                        if (!_scanner.IsRefining && !_scanner.HasRefinedTexture)
+                            throw new InvalidOperationException(
+                                $"Texture refinement failed ({_scanner.RefineStatus}); nothing was saved — see the log");
+                        if (Time.realtimeSinceStartup > deadline)
+                            throw new TimeoutException("Texture refinement timed out (5 min)");
+                        await Task.Yield();
+                    }
+                }
+                finally
+                {
+                    _scanner.RefinedMeshReady -= OnReady;
+                }
             }
 
-            bool saved = await _scanner.SaveScanAsync();
+            // Through SaveAsync, not SaveScanAsync: after an earlier SaveAsync
+            // the refined artifacts above went into that saved package, and
+            // SaveScanAsync would write a second, keyframe-less package
+            // (sharing the anchor UUID) and make it the active one. SaveAsync
+            // sees nothing integrated since and keeps that package; a _tmp
+            // scan is promoted as before. IsRefining is already false here:
+            // StartTextureRefinement clears it in the same frame as
+            // RefinedMeshReady, and this loop resumes a frame later.
+            bool saved = await SaveAsync();
             if (!saved)
                 Logger.Warning("RoomScanSession: save failed — result is in memory only");
 
@@ -380,6 +410,123 @@ namespace Genesis.RoomScan
                 PackageId = _persistence?.ActivePackageId,
                 AnchorFrameMesh = _persistence?.BuildAnchorFrameMesh(_scanner.RefinedMesh)
             };
+        }
+
+        /// <summary>
+        /// Saves the current scan (TSDF volume, keyframes, anchor) as a
+        /// permanent package without refining or releasing anything — the
+        /// same package <see cref="FinalizeScanAsync"/> writes, minus the
+        /// refined mesh. A save needs a still volume, so an active scan is
+        /// stopped first and stays stopped.
+        /// <para>
+        /// The <c>_tmp</c> package becomes <c>pkg_&lt;utc time&gt;</c>, so a
+        /// later <see cref="StartScanAsync"/> begins a <b>new</b> scan (the
+        /// saved one stays on disk; load it with <see cref="LoadAsync"/>).
+        /// Stop without saving to pause and resume the same scan instead.
+        /// Saving again with nothing integrated since returns true without
+        /// writing a duplicate package.
+        /// </para>
+        /// Returns false when there is nothing to save (no integrated scan,
+        /// or the scan GPU resources were already released — a finalized scan
+        /// was saved then), while texture refinement is running (its artifacts
+        /// are still being written into the package; await
+        /// <see cref="FinalizeScanAsync"/> instead), or when the save fails.
+        /// </summary>
+        public async Task<bool> SaveAsync()
+        {
+            if (_scanner == null)
+            {
+                Logger.Error("RoomScanSession: RoomScanner not found");
+                return false;
+            }
+            if (_persistence == null)
+            {
+                Logger.Error("RoomScanSession: RoomScanPersistence not found — cannot save");
+                return false;
+            }
+            if (_scanner.IsRefining)
+            {
+                Logger.Warning("RoomScanSession: texture refinement is running — not saving now (FinalizeScanAsync saves when it finishes)");
+                return false;
+            }
+            if (_scanner.ScanResourcesReleased)
+            {
+                bool saved = _persistence.HasActivePackage && !_persistence.IsTmpPackage;
+                Logger.Warning("RoomScanSession: scan resources were released, nothing in memory to save" +
+                    (saved ? $" (already saved as {_persistence.ActivePackageId})" : ""));
+                return saved;
+            }
+            var volume = _scanner.VolumeIntegrator;
+            int integrations = volume != null ? volume.IntegrationCount : 0;
+            if (integrations == 0)
+            {
+                Logger.Warning("RoomScanSession: nothing integrated yet — not saving an empty scan");
+                return false;
+            }
+            if (_persistence.HasActivePackage && !_persistence.IsTmpPackage
+                && _persistence.ActivePackageId == _lastSavedPackageId
+                && integrations == _lastSavedIntegrations)
+            {
+                Logger.Info($"RoomScanSession: no new integration since the last save — {_lastSavedPackageId} is current");
+                return true;
+            }
+
+            if (_scanner.IsScanning)
+            {
+                Logger.Info("RoomScanSession: stopping the scan to save it");
+                _scanner.StopScanning();
+                // Keyframes captured in the last frames are still being read
+                // back / JPEG-encoded / written into _tmp on workers; let them
+                // land before the save renames that directory.
+                await Task.Delay(500);
+            }
+
+            bool ok = await _scanner.SaveScanAsync();
+            if (ok)
+            {
+                _lastSavedPackageId = _persistence.ActivePackageId;
+                _lastSavedIntegrations = integrations;
+                Logger.Info($"RoomScanSession: scan saved as {_lastSavedPackageId} ({integrations} integrations)");
+            }
+            else
+            {
+                Logger.Warning("RoomScanSession: save failed");
+            }
+            return ok;
+        }
+
+        string _lastSavedPackageId;
+        int _lastSavedIntegrations;
+
+        /// <summary>
+        /// Default folder for <see cref="ExportMeshAsync"/>:
+        /// <c>Application.persistentDataPath/RoomScans/exports</c>. Package
+        /// deletes (<see cref="DeleteScanAsync"/>, <see cref="ClearAllScansAsync"/>)
+        /// leave it alone.
+        /// </summary>
+        public static string DefaultExportDirectory =>
+            Path.Combine(Application.persistentDataPath, "RoomScans", "exports");
+
+        /// <summary>
+        /// Writes the scan as standard mesh files named
+        /// <c>scan_yyyyMMdd_HHmmss</c> (UTC) into <paramref name="directory"/>
+        /// (default <see cref="DefaultExportDirectory"/>): the refined textured
+        /// mesh (OBJ + MTL + PNG) when one exists, otherwise the live
+        /// vertex-coloured mesh (PLY + OBJ). Works while scanning and does not
+        /// stop or save anything. Coordinates and file details are in
+        /// <see cref="RoomScanMeshExport"/>.
+        /// </summary>
+        /// <returns>The written paths; empty when there is no mesh to export.</returns>
+        public Task<string[]> ExportMeshAsync(string directory = null)
+        {
+            if (string.IsNullOrEmpty(directory))
+                directory = DefaultExportDirectory;
+            string baseName = $"scan_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+
+            if (_scanner != null && _scanner.HasRefinedTexture && _scanner.RefinedMesh != null)
+                return RoomScanMeshExport.ExportRefinedMeshAsync(
+                    _scanner.RefinedMesh, _scanner.RefinedAtlas, directory, baseName);
+            return RoomScanMeshExport.ExportLiveMeshAsync(directory, baseName);
         }
 
         /// <summary>

@@ -53,6 +53,7 @@ namespace Genesis.RoomScan
         private GPUSurfaceNets _gpuSurfaceNets;
         private GPUMeshRenderer _gpuRenderer;
         private int _extractCount;
+        private int _extractionHolds;
         float _lastExtractTime;
         float _extractInterval = 0.125f;
         float _morphStart;
@@ -153,12 +154,14 @@ namespace Genesis.RoomScan
 
         /// <summary>
         /// Run one GPU mesh extraction, or skip if a previous dump is still
-        /// morphing on screen. The volume keeps integrating; the next accepted
+        /// morphing on screen or a CPU readback holds the buffers
+        /// (<see cref="HoldExtraction"/>). The volume keeps integrating; the next accepted
         /// extract is whatever the TSDF is when this returns true.
         /// </summary>
         public bool TryExtract()
         {
             if (_gpuSurfaceNets == null) return false;
+            if (_extractionHolds > 0) return false;
             if (meshMorphSeconds > 0.001f && _extractCount > 0
                 && Time.time < _morphStart + meshMorphSeconds)
                 return false;
@@ -167,6 +170,24 @@ namespace Genesis.RoomScan
             _presentLiveLook = true;
             Extract();
             return true;
+        }
+
+        /// <summary>
+        /// Keep <see cref="TryExtract"/> from rewriting the vertex and index
+        /// buffers until the matching <see cref="ReleaseExtraction"/>. A CPU
+        /// readback reads the counters first and the buffers a frame or two
+        /// later (<see cref="GPUMeshReadback"/>); a live extract in between
+        /// would pair one dump's counts with the next dump's data. Explicit
+        /// <see cref="Extract"/> / <see cref="ExtractForAuthoring"/> calls are
+        /// not blocked; readers catch those through <see cref="ExtractCount"/>.
+        /// Counted, so holds nest. The volume keeps integrating meanwhile.
+        /// </summary>
+        internal void HoldExtraction() => _extractionHolds++;
+
+        /// <summary>Ends one <see cref="HoldExtraction"/>.</summary>
+        internal void ReleaseExtraction()
+        {
+            if (_extractionHolds > 0) _extractionHolds--;
         }
 
         /// <summary>

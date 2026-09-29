@@ -211,12 +211,6 @@ namespace Genesis.RoomScan
             compute.SetFloat("_ChartMinCover", chartMinCover);
         }
 
-        // pos @ 0 is the extractor dump. prevPos @ 12 is presentation-only.
-        const int VertStride = GPUSurfaceNets.VertexStride;
-        const int VertPos = GPUSurfaceNets.VertexPosOffset;
-        const int VertNorm = GPUSurfaceNets.VertexNormalOffset;
-        const int VertPacked = GPUSurfaceNets.VertexPackedColorOffset;
-
         internal event Action<string> StatusChanged;
 
         // ═══════════════════════════════════════════════════════════════
@@ -242,8 +236,11 @@ namespace Genesis.RoomScan
             _profile = profileRefinement ? new RefineProfile() : null;
             var readScope = _profile?.Stage("meshReadback");
             ReportStatus("Reading mesh from GPU...");
-            MeshExtractor.Instance?.ExtractForAuthoring();
-            var (positions, normals, colors, indices) = await ReadbackMeshAsync();
+            // Extract + read back as one dump under an extraction hold (see GPUMeshReadback).
+            var snapshot = await GPUMeshReadback.ReadAsync(extractFirst: true, "[TextureRefine]");
+            Vector3[] positions = snapshot?.Positions;
+            Vector3[] normals = snapshot?.Normals;
+            int[] indices = snapshot?.Indices;
             _profile?.Frame();   // the extraction + readback frame lands on this stage, not the next
             readScope?.Dispose();
             if (positions == null || positions.Length == 0)
@@ -349,112 +346,8 @@ namespace Genesis.RoomScan
             };
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        //  MESH READBACK
-        // ═══════════════════════════════════════════════════════════════
-
-        /// <summary>Read back the first <paramref name="byteCount"/> bytes (0 = whole buffer).
-        /// The extractor's buffers are sized to a voxel budget, tens of MB; the
-        /// mesh in them is a few MB. Reading the capacity was a 100 ms frame.</summary>
-        static Task<byte[]> ReadbackBytesAsync(GraphicsBuffer buffer, int byteCount = 0)
-        {
-            var tcs = new System.Threading.Tasks.TaskCompletionSource<byte[]>();
-            System.Action<AsyncGPUReadbackRequest> onDone = request =>
-            {
-                if (request.hasError) { tcs.SetResult(null); return; }
-                var native = request.GetData<byte>();
-                byte[] managed = new byte[native.Length];
-                NativeArray<byte>.Copy(native, managed, native.Length);
-                tcs.SetResult(managed);
-            };
-            if (byteCount > 0)
-                AsyncGPUReadback.Request(buffer, byteCount, 0, onDone);
-            else
-                AsyncGPUReadback.Request(buffer, onDone);
-            return tcs.Task;
-        }
-
-        static async Task<(Vector3[], Vector3[], Color32[], int[])> ReadbackMeshAsync()
-        {
-            var gpuSN = MeshExtractor.Instance?.GpuSurfaceNets;
-            if (gpuSN == null || gpuSN.VertexBuffer == null || gpuSN.IndexBuffer == null)
-            {
-                Logger.Error("[TextureRefine] GpuSurfaceNets or its buffers are null");
-                return (null, null, null, null);
-            }
-
-            Logger.Info("[TextureRefine] Starting GPU readback...");
-
-            // Read all three buffers using callback-based readback
-            // (copies NativeArray to managed array immediately in callback frame)
-            byte[] counterBytes = await ReadbackBytesAsync(gpuSN.CountersBuffer);
-            if (counterBytes == null)
-            {
-                Logger.Error("[TextureRefine] Counter readback failed");
-                return (null, null, null, null);
-            }
-
-            int vertCount = BitConverter.ToInt32(counterBytes, 0);
-            int idxCount = counterBytes.Length >= 8 ? BitConverter.ToInt32(counterBytes, 4) : 0;
-
-            Logger.Info($"[TextureRefine] Counters: verts={vertCount}, idx={idxCount}");
-
-            if (vertCount <= 0 || idxCount <= 0)
-            {
-                Logger.Warning($"[TextureRefine] No mesh data: verts={vertCount}, idx={idxCount}");
-                return (null, null, null, null);
-            }
-
-            vertCount = Mathf.Min(vertCount, gpuSN.VertexBuffer.count);
-            idxCount = Mathf.Min(idxCount, gpuSN.IndexBuffer.count);
-
-            var vertTask = ReadbackBytesAsync(gpuSN.VertexBuffer, vertCount * VertStride);
-            var idxTask = ReadbackBytesAsync(gpuSN.IndexBuffer, idxCount * 4);
-            byte[] vertData = await vertTask;
-            byte[] idxData = await idxTask;
-            if (vertData == null || idxData == null)
-            {
-                Logger.Error("[TextureRefine] Mesh readback failed");
-                return (null, null, null, null);
-            }
-
-            // Parse on a worker: a few MB of BitConverter is still a frame's worth.
-            Vector3[] positions = null, normals = null;
-            Color32[] colors = null;
-            int[] indices = null;
-            await Task.Run(() =>
-            {
-                int vc = Mathf.Min(vertCount, vertData.Length / VertStride);
-                int ic = Mathf.Min(idxCount, idxData.Length / 4);
-                indices = new int[ic];
-                Buffer.BlockCopy(idxData, 0, indices, 0, ic * 4);
-
-                positions = new Vector3[vc];
-                normals = new Vector3[vc];
-                colors = new Color32[vc];
-                for (int i = 0; i < vc; i++)
-                {
-                    int off = i * VertStride;
-                    positions[i] = new Vector3(
-                        BitConverter.ToSingle(vertData, off + VertPos),
-                        BitConverter.ToSingle(vertData, off + VertPos + 4),
-                        BitConverter.ToSingle(vertData, off + VertPos + 8));
-                    normals[i] = new Vector3(
-                        BitConverter.ToSingle(vertData, off + VertNorm),
-                        BitConverter.ToSingle(vertData, off + VertNorm + 4),
-                        BitConverter.ToSingle(vertData, off + VertNorm + 8));
-                    uint packed = BitConverter.ToUInt32(vertData, off + VertPacked);
-                    colors[i] = new Color32(
-                        (byte)(packed & 0xFF),
-                        (byte)((packed >> 8) & 0xFF),
-                        (byte)((packed >> 16) & 0xFF),
-                        255);
-                }
-            });
-
-            Logger.Info($"[TextureRefine] Readback complete: {positions.Length} verts, {indices.Length / 3} tris");
-            return (positions, normals, colors, indices);
-        }
+        // Mesh readback (counters + vertex / index prefix, one extraction under
+        // an extraction hold) lives in GPUMeshReadback, shared with RoomScanMeshExport.
 
         // ═══════════════════════════════════════════════════════════════
         //  TEXTURE BAKE
