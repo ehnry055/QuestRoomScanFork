@@ -11,14 +11,16 @@
 // EnsureURPSetup:
 //   1. Looks for a UniversalRenderPipelineAsset already wired into
 //      GraphicsSettings.defaultRenderPipeline. If one exists and resolves
-//      on disk, it's a no-op.
+//      on disk, it is kept and only Android XR's hard rules (HDR off,
+//      post-processing off) are enforced on it.
 //   2. Otherwise creates Assets/Settings/URP-Pipeline.asset and
 //      Assets/Settings/URP-Renderer.asset using URP's own internal asset
 //      factory (so they get the same default-resource wiring as the
 //      "Create > Rendering > URP Asset (with Universal Renderer)" menu).
-//   3. Applies Quest-friendly defaults (4x MSAA, no HDR, single shadow
-//      cascade, etc.) via SerializedObject so we don't depend on internal
-//      setters that move between URP versions.
+//   3. Applies Android XR defaults: HDR off and post-processing off (both
+//      are errors in the Android XR project validator), plus 4x MSAA, a
+//      single shadow cascade, etc. via SerializedObject so we don't depend
+//      on internal setters that move between URP versions.
 //   4. Assigns the new pipeline asset to GraphicsSettings.defaultRenderPipeline
 //      and to every QualitySettings level so referenced shaders resolve.
 
@@ -44,8 +46,43 @@ namespace Genesis.RoomScan.Editor
         void RefreshURPState()
         {
             _urpAssetCached = GraphicsSettings.defaultRenderPipeline as UniversalRenderPipelineAsset;
-            _urpConfigured  = _urpAssetCached != null
-                              && AllQualityLevelsUseUrp(_urpAssetCached);
+            _urpConfigured  = IsURPConfiguredForAndroidXR(_urpAssetCached);
+        }
+
+        /// <summary>
+        /// The asset is the default pipeline on every quality level, with
+        /// HDR off and no post-processing data on any Universal renderer.
+        /// </summary>
+        internal static bool IsURPConfiguredForAndroidXR(UniversalRenderPipelineAsset asset)
+        {
+            return asset != null
+                   && !asset.supportsHDR
+                   && UrpPostProcessingOff(asset)
+                   && AllQualityLevelsUseUrp(asset);
+        }
+
+        static bool UrpPostProcessingOff(UniversalRenderPipelineAsset asset)
+        {
+            var renderers = asset.rendererDataList;
+            for (int i = 0; i < renderers.Length; i++)
+                if (renderers[i] is UniversalRendererData urd && urd.postProcessData != null)
+                    return false;
+            return true;
+        }
+
+        // Android XR validation (AndroidXRProjectValidationRules): post
+        // processing must be off on the active URP renderer. Null the
+        // PostProcessData on every Universal renderer the asset lists.
+        static void DisableUrpPostProcessing(UniversalRenderPipelineAsset asset)
+        {
+            var renderers = asset.rendererDataList;
+            for (int i = 0; i < renderers.Length; i++)
+            {
+                if (renderers[i] is not UniversalRendererData urd || urd.postProcessData == null) continue;
+                urd.postProcessData = null;
+                EditorUtility.SetDirty(urd);
+                Debug.Log($"[RoomScan Setup] Disabled post-processing on URP renderer '{urd.name}' (Android XR requirement).");
+            }
         }
 
         static bool AllQualityLevelsUseUrp(UniversalRenderPipelineAsset target)
@@ -68,19 +105,39 @@ namespace Genesis.RoomScan.Editor
         }
 
         /// <summary>
-        /// Idempotent: ensures URP-Pipeline.asset + URP-Renderer.asset exist
-        /// at Assets/Settings/, and that GraphicsSettings + every quality
-        /// level point to the pipeline asset. Safe to call repeatedly.
+        /// Idempotent: ensures a URP pipeline asset exists (the one already
+        /// wired into GraphicsSettings, else URP-Pipeline.asset +
+        /// URP-Renderer.asset at Assets/Settings/), that it meets Android
+        /// XR's HDR-off / post-processing-off rules, and that GraphicsSettings
+        /// + every quality level point to it. Safe to call repeatedly.
         /// </summary>
         static UniversalRenderPipelineAsset EnsureURPSetup()
         {
             try
             {
-                if (!Directory.Exists(URP_DIR))
-                    Directory.CreateDirectory(URP_DIR);
+                // Through the AssetDatabase, so CreateAsset below sees the
+                // folder in the same editor update (batch mode included). A
+                // folder already on disk is imported rather than created,
+                // which would make "Settings 1".
+                if (!AssetDatabase.IsValidFolder(URP_DIR))
+                {
+                    if (Directory.Exists(URP_DIR))
+                        AssetDatabase.ImportAsset(URP_DIR);
+                    else
+                        AssetDatabase.CreateFolder(Path.GetDirectoryName(URP_DIR), Path.GetFileName(URP_DIR));
+                }
 
-                var pipeline = AssetDatabase.LoadAssetAtPath<UniversalRenderPipelineAsset>(URP_PIPELINE_PATH);
+                // A URP asset the project already wires in is kept; only the
+                // Android XR requirements (HDR off, post-processing off) are
+                // enforced on it. Our own asset also gets the full defaults.
+                var pipeline = GraphicsSettings.defaultRenderPipeline as UniversalRenderPipelineAsset;
+                if (pipeline != null && string.IsNullOrEmpty(AssetDatabase.GetAssetPath(pipeline)))
+                    pipeline = null;
+                if (pipeline == null)
+                    pipeline = AssetDatabase.LoadAssetAtPath<UniversalRenderPipelineAsset>(URP_PIPELINE_PATH);
 
+                bool ours = pipeline == null
+                            || AssetDatabase.GetAssetPath(pipeline) == URP_PIPELINE_PATH;
                 if (pipeline == null)
                 {
                     pipeline = CreateURPPipelineAsset();
@@ -88,7 +145,15 @@ namespace Genesis.RoomScan.Editor
                     Debug.Log($"[RoomScan Setup] Created {URP_PIPELINE_PATH} (+ renderer).");
                 }
 
-                ApplyQuestFriendlyDefaults(pipeline);
+                if (ours)
+                    ApplyAndroidXRDefaults(pipeline);
+                else if (pipeline.supportsHDR)
+                {
+                    pipeline.supportsHDR = false;
+                    EditorUtility.SetDirty(pipeline);
+                    Debug.Log($"[RoomScan Setup] Disabled HDR on {pipeline.name} (Android XR requirement).");
+                }
+                DisableUrpPostProcessing(pipeline);
 
                 // Wire into GraphicsSettings + every quality level.
                 if (GraphicsSettings.defaultRenderPipeline != pipeline)
@@ -168,13 +233,15 @@ namespace Genesis.RoomScan.Editor
         }
 
         /// <summary>
-        /// Quest-friendly URP defaults: 4x MSAA (Quest GPU has dedicated
-        /// MSAA hardware so it's nearly free), HDR off (saves ~30% bandwidth),
-        /// shadow distance trimmed to 30m, single cascade, soft shadows off.
-        /// SRP batcher stays on. Editing through SerializedObject so we
-        /// don't touch internal setters.
+        /// Android XR (Galaxy XR) URP defaults: HDR off (required by the
+        /// Android XR validator; also saves bandwidth on the tiled Adreno
+        /// GPU), 4x MSAA (resolved on-tile, nearly free), shadow distance
+        /// trimmed to 30m, single cascade, soft shadows off. SRP batcher
+        /// stays on. Editing through SerializedObject so we don't touch
+        /// internal setters. Post-processing is handled on the renderer by
+        /// <see cref="DisableUrpPostProcessing"/>.
         /// </summary>
-        static void ApplyQuestFriendlyDefaults(UniversalRenderPipelineAsset asset)
+        static void ApplyAndroidXRDefaults(UniversalRenderPipelineAsset asset)
         {
             var so = new SerializedObject(asset);
             bool changed = false;
@@ -202,14 +269,14 @@ namespace Genesis.RoomScan.Editor
             SetFloat ("m_ShadowDistance",             30f);
             SetBool  ("m_SoftShadowsSupported",       false);
             SetBool  ("m_UseSRPBatcher",              true);
-            // Single Pass Instanced (multi-view) is set in PlayerSettings via
-            // VRProjectBootstrap; URP picks it up automatically.
+            // Single Pass Instanced (multi-view) is the OpenXR render mode,
+            // set by VRProjectBootstrap; URP picks it up automatically.
 
             if (changed)
             {
                 so.ApplyModifiedPropertiesWithoutUndo();
                 EditorUtility.SetDirty(asset);
-                Debug.Log("[RoomScan Setup] Applied Quest-friendly defaults to URP-Pipeline.asset " +
+                Debug.Log($"[RoomScan Setup] Applied Android XR defaults to {asset.name} " +
                           "(4x MSAA, no HDR, 1 shadow cascade, 30m shadow distance, no soft shadows).");
             }
         }

@@ -468,7 +468,8 @@ namespace Genesis.RoomScan
 
         /// <summary>
         /// Deletes one saved scan package (mesh, atlas, keyframes, triplanar,
-        /// manifest entry) and erases its spatial anchor from Horizon OS.
+        /// manifest entry) and erases its spatial anchor from the platform
+        /// anchor store.
         /// No-op when the id is missing or already gone.
         /// </summary>
         public Task DeleteScanAsync(string packageId)
@@ -481,7 +482,7 @@ namespace Genesis.RoomScan
         /// <summary>
         /// Deletes every saved scan package on disk (mesh, atlas, keyframes,
         /// triplanar, manifest) and erases each package's spatial anchor from
-        /// Horizon OS. Nuclear option — games that keep several packages
+        /// the platform anchor store. Nuclear option — games that keep several packages
         /// should call <see cref="DeleteScanAsync"/> for the one they are
         /// replacing. Safe to call when nothing is saved (returns immediately).
         /// </summary>
@@ -497,20 +498,22 @@ namespace Genesis.RoomScan
         /// <summary>Releases heavy GPU resources. Called automatically by <see cref="FinalizeScanAsync"/>.</summary>
         public void ReleaseScanResources() => _scanner?.ReleaseScanResources();
 
-        // ─── Camera permission (HEADSET_CAMERA on Quest 3+) ──────────────
+        // ─── Runtime permissions (Android XR) ──────────────────────────
         //
-        // PCA can technically wait for the user's permission decision in its
-        // own coroutine (see Meta.XR.PassthroughCameraAccess.OnEnable), but
-        // game code usually wants to surface a deterministic "asking for
-        // permission" UI state and only call StartScan() after the user has
+        // RoomScanner.StartScanningAsync asks for whatever is still missing,
+        // but game code usually wants a deterministic "asking for
+        // permission" UI state and only calls StartScan() after the user has
         // decided. These helpers expose that without making callers reach
-        // into UnityEngine.Android.Permission directly.
+        // into UnityEngine.Android.Permission directly. All of them go
+        // through one serialized request queue, so they can be awaited in
+        // any order without Android dropping a dialog.
 
-        /// <summary>True when the Horizon OS HEADSET_CAMERA permission has
-        /// been granted. Always true outside Android device builds.</summary>
+        /// <summary>True when <c>android.permission.CAMERA</c> (world-facing
+        /// RGB camera) has been granted. Always true outside Android device
+        /// builds.</summary>
         public bool HasCameraPermission => PassthroughCameraProvider.HasCameraPermission;
 
-        /// <summary>Asynchronously requests the HEADSET_CAMERA permission and
+        /// <summary>Asynchronously requests <c>android.permission.CAMERA</c> and
         /// resolves once the user accepts, denies, or dismisses the system
         /// dialog. Call this <b>before</b> <see cref="StartScan"/> to avoid
         /// scanning in degraded depth-only mode while the dialog is up.
@@ -519,23 +522,33 @@ namespace Genesis.RoomScan
         public Task<bool> RequestCameraPermissionAsync()
             => PassthroughCameraProvider.RequestCameraPermissionAsync();
 
-        /// <summary>True when Horizon OS <c>USE_SCENE</c> (spatial data) is
-        /// granted. Always true outside Android device builds.</summary>
+        /// <summary>True when <c>android.permission.SCENE_UNDERSTANDING_FINE</c>
+        /// (environment depth — required to scan) is granted. Always true
+        /// outside Android device builds.</summary>
         public bool HasScenePermission => AndroidRuntimePermission.Has(AndroidRuntimePermission.Scene);
 
-        /// <summary>Requests spatial-data permission. Resolves true if already
-        /// granted, or outside Android device builds.</summary>
+        /// <summary>Requests <c>SCENE_UNDERSTANDING_FINE</c>. Resolves true if
+        /// already granted, or outside Android device builds.</summary>
         public Task<bool> RequestScenePermissionAsync()
             => AndroidRuntimePermission.RequestAsync(AndroidRuntimePermission.Scene);
 
-        /// <summary>True when Horizon OS <c>USE_ANCHOR_API</c> is granted.
-        /// Always true outside Android device builds.</summary>
+        /// <summary>True when <c>android.permission.SCENE_UNDERSTANDING_COARSE</c>
+        /// (anchors) is granted. Always true outside Android device builds.</summary>
         public bool HasAnchorPermission => AndroidRuntimePermission.Has(AndroidRuntimePermission.Anchors);
 
-        /// <summary>Requests spatial-anchor permission. Resolves true if
+        /// <summary>Requests <c>SCENE_UNDERSTANDING_COARSE</c>. Resolves true if
         /// already granted, or outside Android device builds.</summary>
         public Task<bool> RequestAnchorPermissionAsync()
             => AndroidRuntimePermission.RequestAsync(AndroidRuntimePermission.Anchors);
+
+        /// <summary>True when <c>android.permission.HAND_TRACKING</c> is
+        /// granted. Always true outside Android device builds.</summary>
+        public bool HasHandTrackingPermission => AndroidRuntimePermission.Has(AndroidRuntimePermission.HandTracking);
+
+        /// <summary>Requests <c>HAND_TRACKING</c>. Resolves true if already
+        /// granted, or outside Android device builds.</summary>
+        public Task<bool> RequestHandTrackingPermissionAsync()
+            => AndroidRuntimePermission.RequestAsync(AndroidRuntimePermission.HandTracking);
 
         /// <summary>True after MRUK <c>LoadSceneFromDevice</c> finished,
         /// including an empty space. All discovery anchors are present.
@@ -695,9 +708,10 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// Re-run MRUK scene discovery without opening Space Setup. Use after
-        /// spatial-data permission is granted: the first boot load often
-        /// finished with zero rooms while <c>USE_SCENE</c> was still denied.
+        /// Re-run scene discovery without opening space setup. Use after
+        /// scene-understanding permission is granted: a boot-time load can
+        /// finish with zero rooms while it was still denied. (Scene discovery
+        /// is currently a stub on Android XR; see <see cref="RoomAnchorManager"/>.)
         /// </summary>
         public Task<bool> ReloadSceneFromDeviceAsync()
         {
@@ -707,10 +721,10 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// Opens Horizon Space Setup (Unity app pauses), then reloads the
-        /// scene model with auto-capture off. Returns true only when rooms
-        /// exist afterwards — cancel still completes the OS API as true.
-        /// Device-only; editor returns the current room flag.
+        /// Opens the platform's space setup, then reloads the scene model.
+        /// Returns true only when rooms exist afterwards. Currently a stub on
+        /// Android XR (see <see cref="RoomAnchorManager"/>): it returns the
+        /// current room flag without opening anything.
         /// </summary>
         public Task<bool> RequestSpaceSetupAndReloadAsync()
         {

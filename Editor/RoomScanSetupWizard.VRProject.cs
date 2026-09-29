@@ -1,4 +1,4 @@
-// Wizard partial: VR PROJECT BOOTSTRAP section.
+// Wizard partial: ANDROID XR PROJECT (Samsung Galaxy XR) section.
 //
 // Purely presentation layer — all logic lives in VRProjectBootstrap.cs so it
 // can also be invoked from CI / menu items / other tooling later.
@@ -14,7 +14,7 @@ namespace Genesis.RoomScan.Editor
     {
         // Cached audit snapshot. Refreshed on the wizard's heartbeat so the
         // counts in the section header stay live as the user fixes things via
-        // other paths (Project Settings, Meta tool, etc.).
+        // other paths (Project Settings, Project Validation, etc.).
         readonly List<VRCheck> _vrOutstanding = new();
         readonly List<VRCheck> _vrRecommended = new();
         readonly List<VRCheck> _vrOk          = new();
@@ -59,12 +59,14 @@ namespace Genesis.RoomScan.Editor
 
         partial void DrawVRProjectSection()
         {
-            BeginSection("VR PROJECT BOOTSTRAP");
+            BeginSection("ANDROID XR PROJECT (GALAXY XR)");
 
             EditorGUILayout.HelpBox(
-                "Audits and fixes project-level VR config (XR Plug-in Management, OpenXR " +
-                "features, PlayerSettings, OpenXR feature set).\n" +
-                "Generic to every Quest project — does not write per-game identity.",
+                "Audits and fixes project-level config for Samsung Galaxy XR: plain Android " +
+                "platform, OpenXR loader, the Unity OpenXR: Android XR feature set (Meta Quest " +
+                "features forced off), OpenXR render settings and PlayerSettings.\n" +
+                "Only per-game identity written: a default app id (" + VRProjectBootstrap.DEFAULT_APP_ID +
+                ") while the project still has Unity's placeholder.",
                 MessageType.Info);
 
             // Top-of-section status line
@@ -109,7 +111,7 @@ namespace Genesis.RoomScan.Editor
 
             if (_vrFixInProgress)
             {
-                EditorGUILayout.HelpBox("Fixing in progress (including Meta XR Project Setup Tool sweep)…",
+                EditorGUILayout.HelpBox("Fixing in progress\u2026",
                     MessageType.Info);
             }
 

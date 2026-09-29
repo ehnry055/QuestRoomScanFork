@@ -109,6 +109,10 @@ void Integrate(uint id : SV_DispatchThreadID)
     if (old.y < 0) return; // frozen voxel — skip integration
 
     float depthNDC = gsDepthSample(voxNDC.xy);
+    // NDC 0 is "no depth" (Android XR invalid, unreadable or +Inf pixels). It
+    // would decode to a point on the near plane; skip the ray explicitly
+    // rather than relying on the band and body exclusion to reject it.
+    if (depthNDC <= 0.0) return;
     float3 depthNorm = gsDepthNormalSample(voxNDC.xy).xyz;
     float3 depthPos = gsDepthNDCtoWorld(float3(voxNDC.xy, depthNDC));
     if (!gsInsideRoom(depthPos)) return;

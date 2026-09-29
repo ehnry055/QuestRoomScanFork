@@ -1,10 +1,15 @@
-// Activate Unity 6's Meta Quest *build profile* (not just plain Android).
+// Keep the project on Unity's *plain Android* classic platform.
 //
-// Unity 6.1+ ships a derived "Meta Quest" classic platform on top of Android
-// with its own player/quality overrides (Vulkan, IL2CPP, ARM64, MultiView,
-// Quest-tuned quality level). It is auto-registered by the Editor when the
-// Android module is installed, and it lives alongside the plain Android
-// profile in `BuildProfileContext.classicPlatformProfiles`.
+// Samsung Galaxy XR builds use the plain Android platform with the OpenXR
+// loader and the Unity OpenXR: Android XR feature set. That is the
+// configuration that has actually run on an SM-I610 (GalaxyXR_Audio). Unity
+// 6.1+ also registers *derived* classic platforms on top of Android (the
+// "Android XR" platform, and vendor headset platforms). Those add their own
+// scripting defines and player / quality overrides, and the Android XR one
+// re-applies its default feature set (scene meshing, planes, face tracking,
+// ...) on every domain reload. So this wizard does not use them: when a
+// derived platform or a custom build profile asset is active, it switches
+// back to plain Android.
 //
 // IMPORTANT BACKGROUND
 // --------------------
@@ -15,19 +20,18 @@
 //    See `BuildProfileContext.activeProfile` setter in the Unity reference
 //    source — it logs that exact warning if you try.
 //
-// 2. The supported way to switch a *classic* platform (which Meta Quest is —
-//    a derived platform of Android) is the internal native binding
-//    `EditorUserBuildSettings.SwitchActiveBuildTargetGuid(BuildProfile)`,
-//    wrapped publicly in 6000.2 by
+// 2. The supported way to switch to a *classic* platform is the internal
+//    native binding `EditorUserBuildSettings.SwitchActiveBuildTargetGuid
+//    (BuildProfile)`, wrapped publicly in 6000.2 by
 //    `BuildProfileModuleUtil.SwitchLegacyActiveFromBuildProfile(p)`. Both
 //    are reached here via reflection because the wrapper status flips
 //    between Unity versions.
 //
-// 3. The Meta Quest derived-platform GUID is hardcoded in
+// 3. The plain Android platform GUID is hardcoded in
 //    `BuildTargetDiscovery.bindings.cs` as
-//    "80657fe557de4d17822398b3a01b8c9e". We hardcode the same constant
-//    here so we don't depend on display-name strings (localised) or on
-//    `m_BuildSubtarget == 6` heuristics.
+//    "b9b35072a6f44c2e863f17467ea3dc13" (verified against the 6000.4
+//    UnityEditor.CoreModule string table). We hardcode the same constant
+//    so we don't depend on localised display names.
 
 using System;
 using System.Collections;
@@ -40,10 +44,16 @@ namespace Genesis.RoomScan.Editor
 {
     public partial class RoomScanSetupWizard
     {
-        // Stable GUID Unity uses internally for the Meta Quest derived
-        // platform (see Editor/Mono/BuildTargetDiscovery.bindings.cs in
-        // the Unity reference source).
-        const string k_MetaQuestPlatformGuid = "80657fe557de4d17822398b3a01b8c9e";
+        // Stable GUID Unity uses internally for the plain Android classic
+        // platform (see Editor/Mono/BuildTargetDiscovery.bindings.cs in the
+        // Unity reference source).
+        const string k_AndroidPlatformGuid = "b9b35072a6f44c2e863f17467ea3dc13";
+
+        // Unity's derived "Android XR" classic platform. Only used to give a
+        // readable label when it is the active platform.
+        const string k_AndroidXRDerivedPlatformGuid = "a71389c8cc8e4edc99d30db86d62ee8f";
+
+        const string k_EmptyGuid = "00000000000000000000000000000000";
 
         // Cached reflective handles. Populated lazily by
         // ResolveBuildProfileApi() and reused.
@@ -54,7 +64,6 @@ namespace Genesis.RoomScan.Editor
         static MethodInfo _bpSwitchActiveByProfile;          // EditorUserBuildSettings.SwitchActiveBuildTargetGuid(BuildProfile)
         static MethodInfo _bpModuleUtilSwitchLegacy;         // BuildProfileModuleUtil.SwitchLegacyActiveFromBuildProfile(BuildProfile) — public wrapper in 6000.2
         static PropertyInfo _bpActivePlatformGuidProp;       // EditorUserBuildSettings.activePlatformGuid (internal)
-        static MethodInfo _bpGuidEmptyMethod;                // UnityEditor.GUID.Empty()
         static Type _bpGuidType;
         static ConstructorInfo _bpGuidStringCtor;
 
@@ -119,11 +128,6 @@ namespace Genesis.RoomScan.Editor
                     "activePlatformGuid",
                     BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
 
-                _bpGuidEmptyMethod = _bpGuidType?.GetMethod(
-                    "Empty",
-                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
-                    null, Type.EmptyTypes, null);
-
                 return true;
             }
             catch (Exception ex)
@@ -134,27 +138,78 @@ namespace Genesis.RoomScan.Editor
             }
         }
 
-        // Returns a reflected UnityEditor.GUID for the Meta Quest derived
+        // Returns a reflected UnityEditor.GUID for the plain Android
         // platform. Returns null if the GUID type isn't available.
-        static object MetaQuestGuid()
+        static object AndroidPlatformGuid()
         {
             if (_bpGuidStringCtor == null) return null;
-            try { return _bpGuidStringCtor.Invoke(new object[] { k_MetaQuestPlatformGuid }); }
+            try { return _bpGuidStringCtor.Invoke(new object[] { k_AndroidPlatformGuid }); }
             catch { return null; }
         }
 
         /// <summary>
-        /// Returns the auto-generated classic Meta Quest BuildProfile if
-        /// Unity has registered one (Unity 6.1+ with Android module), or
-        /// null otherwise.
+        /// The active classic platform GUID as 32 hex chars, or null when
+        /// the internal API is unavailable.
         /// </summary>
-        static BuildProfile FindMetaQuestClassicProfile()
+        static string ActivePlatformGuidString()
+        {
+            if (!ResolveBuildProfileApi() || _bpActivePlatformGuidProp == null) return null;
+            try { return _bpActivePlatformGuidProp.GetValue(null)?.ToString(); }
+            catch { return null; }
+        }
+
+        static BuildProfile ActiveCustomBuildProfile()
+        {
+            try { return BuildProfile.GetActiveBuildProfile(); }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// True when the active build target is Android, no custom build
+        /// profile asset is active, and the active classic platform is plain
+        /// Android rather than a derived platform. An empty / unreadable
+        /// platform GUID (projects that never touched Build Profiles) counts
+        /// as plain Android.
+        /// </summary>
+        internal static bool IsActivePlatformPlainAndroid()
+        {
+            if (EditorUserBuildSettings.activeBuildTarget != BuildTarget.Android) return false;
+            if (ActiveCustomBuildProfile() != null) return false;
+
+            var guid = ActivePlatformGuidString();
+            if (string.IsNullOrEmpty(guid) || guid == k_EmptyGuid) return true;
+            return string.Equals(guid, k_AndroidPlatformGuid, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>Human-readable name of the active platform / profile.</summary>
+        internal static string DescribeActivePlatform()
+        {
+            var custom = ActiveCustomBuildProfile();
+            if (custom != null) return $"custom build profile '{custom.name}'";
+
+            var target = EditorUserBuildSettings.activeBuildTarget;
+            if (target != BuildTarget.Android) return target.ToString();
+
+            var guid = ActivePlatformGuidString();
+            if (string.IsNullOrEmpty(guid) || guid == k_EmptyGuid
+                || string.Equals(guid, k_AndroidPlatformGuid, StringComparison.OrdinalIgnoreCase))
+                return "Android (plain)";
+            if (string.Equals(guid, k_AndroidXRDerivedPlatformGuid, StringComparison.OrdinalIgnoreCase))
+                return "Android XR derived platform";
+            return $"derived Android platform {guid}";
+        }
+
+        /// <summary>
+        /// Returns the classic plain-Android BuildProfile Unity registers
+        /// when the Android module is installed, or null.
+        /// </summary>
+        static BuildProfile FindPlainAndroidClassicProfile()
         {
             if (!ResolveBuildProfileApi()) return null;
 
             try
             {
-                var guid = MetaQuestGuid();
+                var guid = AndroidPlatformGuid();
                 if (guid != null && _bpGetForClassicPlatformByGuid != null)
                 {
                     var profile = _bpGetForClassicPlatformByGuid.Invoke(_bpContextInstance, new[] { guid }) as BuildProfile;
@@ -174,96 +229,87 @@ namespace Genesis.RoomScan.Editor
                     {
                         if (item is not BuildProfile p) continue;
                         var g = guidStrProp?.GetValue(p)?.ToString();
-                        if (string.Equals(g, k_MetaQuestPlatformGuid, StringComparison.OrdinalIgnoreCase))
+                        if (string.Equals(g, k_AndroidPlatformGuid, StringComparison.OrdinalIgnoreCase))
                             return p;
                     }
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogWarning($"[RoomScan Setup] Meta Quest profile lookup failed: {ex.Message}");
+                Debug.LogWarning($"[RoomScan Setup] Android classic profile lookup failed: {ex.Message}");
             }
             return null;
         }
 
         /// <summary>
-        /// True if the Meta Quest classic platform is currently the active
-        /// platform/profile selection in the Build Profiles window.
+        /// Makes plain Android the active platform. Uses the public
+        /// SwitchActiveBuildTarget when the active target is not Android at
+        /// all, and the internal classic-platform switch when Android is
+        /// active through a derived platform or a custom profile. Returns
+        /// true when a switch was issued (a domain reload will follow).
         /// </summary>
-        static bool IsActiveProfileMetaQuest()
+        internal static bool TryActivatePlainAndroidPlatform()
         {
-            if (EditorUserBuildSettings.activeBuildTarget != BuildTarget.Android) return false;
-            if (!ResolveBuildProfileApi() || _bpActivePlatformGuidProp == null) return false;
+            if (IsActivePlatformPlainAndroid()) return false;
 
-            try
-            {
-                var activeGuid = _bpActivePlatformGuidProp.GetValue(null);
-                return string.Equals(activeGuid?.ToString(), k_MetaQuestPlatformGuid, StringComparison.OrdinalIgnoreCase);
-            }
-            catch
-            {
-                return false;
-            }
-        }
+            string from = DescribeActivePlatform();
 
-        /// <summary>
-        /// Activates the classic Meta Quest build profile via the internal
-        /// classic-platform switching API. Returns true on success (a
-        /// domain reload will follow). If no Meta Quest profile is
-        /// registered or the API isn't accessible, returns false so
-        /// callers can fall back to plain Android.
-        /// </summary>
-        static bool TryActivateMetaQuestProfile()
-        {
-            if (!ResolveBuildProfileApi()) return false;
-
-            var profile = FindMetaQuestClassicProfile();
+            // Prefer the classic-profile switch: it also leaves a derived
+            // platform or a custom profile, which SwitchActiveBuildTarget
+            // does not when the target is already Android.
+            var profile = FindPlainAndroidClassicProfile();
             if (profile == null)
             {
                 // Profile dictionary is populated lazily on first access to
-                // the BuildProfileContext UI. Touch a few public APIs to
-                // trigger lazy creation, then retry once.
+                // the BuildProfileContext UI. Touch a public API to trigger
+                // lazy creation, then retry once.
                 try { _ = BuildProfile.GetActiveBuildProfile(); } catch { /* ignore */ }
-                profile = FindMetaQuestClassicProfile();
+                profile = FindPlainAndroidClassicProfile();
             }
-            if (profile == null) return false;
 
-            // Prefer the public BuildProfileModuleUtil wrapper when it's
-            // available — it's what Unity's own UI calls.
-            try
+            if (profile != null)
             {
-                if (_bpModuleUtilSwitchLegacy != null)
+                try
                 {
-                    _bpModuleUtilSwitchLegacy.Invoke(null, new object[] { profile });
-                    Debug.Log("[RoomScan Setup] Activated Meta Quest classic build profile " +
-                              "(via BuildProfileModuleUtil.SwitchLegacyActiveFromBuildProfile).");
-                    return true;
-                }
-
-                if (_bpSwitchActiveByProfile != null)
-                {
-                    var ok = _bpSwitchActiveByProfile.Invoke(null, new object[] { profile });
-                    bool success = ok is bool b ? b : true;
-                    if (success)
+                    if (_bpModuleUtilSwitchLegacy != null)
                     {
-                        Debug.Log("[RoomScan Setup] Activated Meta Quest classic build profile " +
-                                  "(via EditorUserBuildSettings.SwitchActiveBuildTargetGuid).");
+                        _bpModuleUtilSwitchLegacy.Invoke(null, new object[] { profile });
+                        Debug.Log($"[RoomScan Setup] Switched {from} → plain Android platform " +
+                                  "(via BuildProfileModuleUtil.SwitchLegacyActiveFromBuildProfile).");
                         return true;
                     }
-                    Debug.LogWarning("[RoomScan Setup] SwitchActiveBuildTargetGuid returned false.");
-                    return false;
-                }
 
-                Debug.LogWarning("[RoomScan Setup] No internal API available to activate the " +
-                                 "Meta Quest classic profile (Unity " + Application.unityVersion + ").");
-                return false;
+                    if (_bpSwitchActiveByProfile != null)
+                    {
+                        var ok = _bpSwitchActiveByProfile.Invoke(null, new object[] { profile });
+                        if (ok is not bool b || b)
+                        {
+                            Debug.Log($"[RoomScan Setup] Switched {from} → plain Android platform " +
+                                      "(via EditorUserBuildSettings.SwitchActiveBuildTargetGuid).");
+                            return true;
+                        }
+                        Debug.LogWarning("[RoomScan Setup] SwitchActiveBuildTargetGuid returned false.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[RoomScan Setup] Plain Android platform activation failed: " +
+                                     (ex.InnerException?.Message ?? ex.Message));
+                }
             }
-            catch (Exception ex)
+
+            if (EditorUserBuildSettings.activeBuildTarget != BuildTarget.Android)
             {
-                Debug.LogWarning("[RoomScan Setup] Meta Quest profile activation failed: " +
-                                 (ex.InnerException?.Message ?? ex.Message));
-                return false;
+                bool switched = EditorUserBuildSettings.SwitchActiveBuildTarget(
+                    BuildTargetGroup.Android, BuildTarget.Android);
+                Debug.Log($"[RoomScan Setup] SwitchActiveBuildTarget {from} → Android: {(switched ? "ok" : "FAILED")}.");
+                return switched;
             }
+
+            Debug.LogWarning($"[RoomScan Setup] Active platform is {from} and no internal API is " +
+                             "available to switch it (Unity " + Application.unityVersion + "). " +
+                             "Select plain Android in File > Build Profiles by hand.");
+            return false;
         }
     }
 }

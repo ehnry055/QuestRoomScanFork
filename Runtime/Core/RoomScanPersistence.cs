@@ -45,7 +45,7 @@ namespace Genesis.RoomScan
 
     /// <summary>
     /// Per-artifact anchor matrices. All matrices are from localizing the same
-    /// OVRSpatialAnchor in different sessions. Each artifact tracks the anchor's
+    /// spatial anchor in different sessions. Each artifact tracks the anchor's
     /// localToWorldMatrix at the time it was created / saved to disk.
     /// </summary>
     [Serializable]
@@ -1224,7 +1224,7 @@ namespace Genesis.RoomScan
         /// false. Intended for game flows where there is exactly one "current"
         /// scan and a rescan should obsolete everything that came before.
         /// Each per-package delete goes through <see cref="DeletePackageAsync"/>
-        /// so spatial anchors get erased from Horizon OS too.
+        /// so spatial anchors get erased from the platform anchor store too.
         /// <para>
         /// Deliberately does NOT touch the <c>_tmp/</c> working dir or
         /// <see cref="ActivePackageId"/> when it points at <c>_tmp</c> — that's

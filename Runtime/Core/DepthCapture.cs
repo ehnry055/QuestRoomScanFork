@@ -39,8 +39,18 @@ namespace Genesis.RoomScan
         [SerializeField] private float voxelDistance = 0.2f;
         [SerializeField] private float voxelSize = 0.05f;
 
+        [Header("Linear depth (Android XR)")]
+        [Tooltip("Near plane (m) used to re-encode the Android XR provider's linear-metre depth into the NDC the depth shaders decode, and for the depth projection matrix. Depth closer than this is treated as invalid. The provider's own near/far (Camera.main clip planes) is ignored.")]
+        [SerializeField, Min(0.01f)] private float linearDepthNear = 0.1f;
+        [Tooltip("Far plane (m) for the same encoding. Kept finite so NDC 1 decodes to a real point instead of Inf/NaN. What happens to depth at or beyond it, and to +Inf ('very far'), is set by carveOnInfiniteDepth.")]
+        [SerializeField, Min(0.5f)] private float linearDepthFar = 20f;
+        [Tooltip("Flip the converted depth vertically. Off by default. The periodic 'orientation' log line (look down at the floor) says which value is right.")]
+        [SerializeField] private bool flipLinearDepthY;
+        [Tooltip("Treat +Inf and depth at or beyond the far plane as open space that carves the volume. Off by default: such pixels are invalid, like 0, which matches how Quest's infinite-far NDC 1 was rejected. Turn on only if the depth row log shows +inf solely where the room really is open.")]
+        [SerializeField] private bool carveOnInfiniteDepth;
+
         [Header("Hand removal")]
-        [Tooltip("Ask the Meta occlusion subsystem to inpaint hands/controllers out of the depth texture. Needs hand tracking; the runtime disables this while holding controllers. Capsule exclusion still covers that case.")]
+        [Tooltip("Meta occlusion subsystem only: ask it to inpaint hands out of the depth texture. The Android XR occlusion provider has no hand removal, so this has no effect on Galaxy XR; capsule exclusion is the only hand filter there.")]
         [SerializeField] private bool removeHandsFromDepth = true;
 
         private readonly Matrix4x4[] _proj = new Matrix4x4[2];
@@ -79,6 +89,18 @@ namespace Genesis.RoomScan
         public static readonly int VoxDistID = Shader.PropertyToID("gsVoxDist");
         public static readonly int VoxSizeShaderID = Shader.PropertyToID("gsVoxSize");
 
+        // Linear-depth (XR_LINEAR_DEPTH) conversion property IDs
+        private static readonly int InputLinearDepthID = Shader.PropertyToID("gsInputLinearDepth");
+        private static readonly int LinearDepthNdcParamsID = Shader.PropertyToID("gsLinearDepthNdcParams");
+        private static readonly int LinearDepthInfoID = Shader.PropertyToID("gsLinearDepthInfo");
+        private static readonly int LinearDepthInfo2ID = Shader.PropertyToID("gsLinearDepthInfo2");
+
+        /// <summary>
+        /// AR Foundation shader keyword a provider enables when its depth texture
+        /// holds linear metres instead of NDC (the Android XR occlusion provider does).
+        /// </summary>
+        private const string LinearDepthKeyword = "XR_LINEAR_DEPTH";
+
         // Bilateral filter property IDs
         private static readonly int BilSrcDepthID = Shader.PropertyToID("_SrcDepth");
         private static readonly int BilRGBGuideID = Shader.PropertyToID("_RGBGuide");
@@ -94,7 +116,18 @@ namespace Genesis.RoomScan
         public static bool DepthAvailable { get; private set; }
 
         /// <summary>
-        /// True after USE_SCENE permission is observed (requested by
+        /// Increments each time a depth frame with a new timestamp arrives. The
+        /// Android XR provider re-delivers its last depth frame (same exposure
+        /// timestamp) every render frame until a new one lands, so a consumer
+        /// that must not fuse the same depth twice can compare this with the
+        /// value it last used. Counts every frame when no timestamp is given.
+        /// </summary>
+        public int DepthFrameSerial => _newDepthFrameCount;
+
+        /// <summary>
+        /// True after the scene-understanding permission
+        /// (<see cref="AndroidRuntimePermission.Scene"/>, SCENE_UNDERSTANDING_FINE on
+        /// Android XR) is observed (requested by
         /// <see cref="RoomScanner.StartScanningAsync"/>, or earlier by the host via
         /// <see cref="RoomScanSession.RequestScenePermissionAsync"/>). Does not
         /// start the depth sensor. <see cref="StartDepthCapture"/> queues until
@@ -110,6 +143,7 @@ namespace Genesis.RoomScan
 
         private ComputeKernelHelper _normKernel;
         private ComputeKernelHelper _monoConvertKernel;
+        private ComputeKernelHelper _linearToNdcKernel;
         private ComputeKernelHelper _initDilateKernel;
         private ComputeKernelHelper _dilateStepKernel;
         private ComputeKernelHelper _bilateralKernel;
@@ -130,6 +164,8 @@ namespace Genesis.RoomScan
 
         private RenderTexture _simulatedDepthTex;
         private RenderTexture _filteredDepthTex;
+        /// <summary>XR_LINEAR_DEPTH source re-encoded as NDC (R32_SFloat, 2 slices).</summary>
+        private RenderTexture _linearDepthNdcTex;
         private int _dilationMaxStep;
 
         private Texture _rgbGuide;
@@ -143,9 +179,30 @@ namespace Genesis.RoomScan
         private int _frameCount;
         private float _lastLogTime;
 
-        private bool _handRemovalLogged;
+        // Periodic-log window and new-frame (distinct timestamp) tracking.
+        private int _newDepthFrameCount;
+        private long _lastDepthTimestamp = long.MinValue;
+        private int _logFrameCount;
+        private int _logNewDepthFrameCount;
 
-        private const string ScenePermission = "com.oculus.permission.USE_SCENE";
+        /// <summary>How the provider's depth texture is encoded; logged once per change.</summary>
+        private enum DepthEncoding { None, ProviderNdc, LinearMetres }
+        private DepthEncoding _encoding;
+        private DepthEncoding _loggedEncoding;
+        private Texture _sourceDepthTex;
+        private bool _loggedNoDepthTexture;
+        private bool _loggedNoViews;
+        private bool _loggedBadPlanes;
+        private bool _loggedBadDimension;
+
+        // One-row readback of the linear source for the periodic log.
+        private bool _rowReadbackPending;
+        private int _rowSampleY;
+        private int _rowSampleHeight;
+        private int _rowSampleWidth;
+        private float _rowSamplePitch;
+
+        private bool _handRemovalLogged;
 
         /// <summary>Raised after each depth frame is processed (filtering, normals computed, globals set).</summary>
         public event Action Updated;
@@ -160,7 +217,8 @@ namespace Genesis.RoomScan
 
         /// <summary>
         /// Convert a pose from XR tracking space to Unity world space.
-        /// Required because MRUK's world-lock may offset TrackingSpace from the XROrigin root.
+        /// Required because the XR Origin's camera-offset object (floor offset,
+        /// recentering) may offset tracking space from the XROrigin root.
         /// </summary>
         public Pose TrackingToWorld(Pose trackingPose)
         {
@@ -174,7 +232,7 @@ namespace Genesis.RoomScan
         {
             Instance = this;
             // All Awakes run before any OnEnable. Disable here so a scene-serialized
-            // AROcclusionManager never starts the Quest depth sensor at load.
+            // AROcclusionManager never starts the headset depth sensor at load.
             var occl = FindAnyObjectByType<AROcclusionManager>(FindObjectsInactive.Include);
             if (occl != null)
                 occl.enabled = false;
@@ -184,7 +242,7 @@ namespace Genesis.RoomScan
         {
             // Editor + no XR loader = AR subsystems will all be null and any
             // toggle of AROcclusionManager.enabled blows up DestroyTextures.
-            // Build/run on Quest (or via Link) to actually scan.
+            // Build and run on the headset to actually scan.
             if (!XRRuntimeGuard.IsXRActive)
             {
                 Logger.Warning("DepthCapture: " + XRRuntimeGuard.EditorDisabledMessage);
@@ -203,6 +261,7 @@ namespace Genesis.RoomScan
 
             _normKernel = new ComputeKernelHelper(depthNormalCompute, "DepthNorm");
             _monoConvertKernel = new ComputeKernelHelper(depthNormalCompute, "MonoRawDepthToStereo");
+            _linearToNdcKernel = new ComputeKernelHelper(depthNormalCompute, "LinearDepthToNDC");
             _initDilateKernel = new ComputeKernelHelper(depthDilationCompute, "InitDepthDilation");
             _dilateStepKernel = new ComputeKernelHelper(depthDilationCompute, "DilateDepthStep");
             if (bilateralFilterCompute != null)
@@ -255,23 +314,24 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// Observe <c>USE_SCENE</c> without starting capture. Does <b>not</b>
-        /// call <c>RequestUserPermission</c> — a second request while the host
-        /// (or <c>OVRManager</c>) already has a dialog up is dropped by Android
-        /// with no UI. The one requester is <c>AndroidRuntimePermission</c>, driven by
+        /// Observe the scene-understanding permission
+        /// (<see cref="AndroidRuntimePermission.Scene"/>) without starting capture.
+        /// Does <b>not</b> call <c>RequestUserPermission</c> — a second request
+        /// while the host already has a dialog up is dropped by Android with no
+        /// UI. The one requester is <c>AndroidRuntimePermission</c>, driven by
         /// <see cref="RoomScanner.StartScanningAsync"/> (and optionally the host at boot).
         /// </summary>
         private void CheckPermissionAndMarkReady()
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
-            if (Permission.HasUserAuthorizedPermission(ScenePermission))
+            if (Permission.HasUserAuthorizedPermission(AndroidRuntimePermission.Scene))
             {
                 MarkScenePermissionReady();
             }
             else if (!_permissionReady)
             {
                 Logger.Info(
-                    "USE_SCENE not granted yet — waiting (RoomScanner requests it at scan start)");
+                    $"{AndroidRuntimePermission.Scene} not granted yet — waiting (RoomScanner requests it at scan start)");
             }
 #else
             MarkScenePermissionReady();
@@ -282,14 +342,15 @@ namespace Genesis.RoomScan
         {
             if (_permissionReady) return;
             _permissionReady = true;
-            Logger.Info("DepthCapture: USE_SCENE ready (sensor stays off until StartDepthCapture)");
+            Logger.Info($"DepthCapture: {AndroidRuntimePermission.Scene} ready (sensor stays off until StartDepthCapture)");
         }
 
         private bool _subscribed;
 
         /// <summary>
-        /// Enable the occlusion subsystem only while a scan is active and
-        /// USE_SCENE is granted. Permission alone must not start the sensor.
+        /// Enable the occlusion subsystem only while a scan is active and the
+        /// scene-understanding permission is granted. Permission alone must not
+        /// start the sensor.
         /// </summary>
         private void ApplyCaptureState()
         {
@@ -322,10 +383,11 @@ namespace Genesis.RoomScan
 
         /// <summary>
         /// Meta's occlusion subsystem can inpaint hands out of the depth
-        /// texture (TSDF-safe). The Unity.XR.MetaOpenXR assembly is a
-        /// project-level OpenXR plugin, not a package.json dependency, so
-        /// this uses the type name + TrySetHandRemovalEnabled rather than a
-        /// hard reference.
+        /// texture (TSDF-safe); it is reached by type name +
+        /// TrySetHandRemovalEnabled so there is no hard reference. The Android
+        /// XR occlusion provider (Galaxy XR) has no hand removal, so there this
+        /// returns at the type-name check and does nothing; hands are kept out
+        /// of the volume only by RoomScanner's exclusion capsules.
         /// </summary>
         void TryEnableHandRemoval()
         {
@@ -358,23 +420,24 @@ namespace Genesis.RoomScan
 
         /// <summary>
         /// Enables the AROcclusionManager and subscribes to depth frames.
-        /// Called by RoomScanner when scanning starts. If USE_SCENE is not
-        /// yet granted, capture starts when the host permission arrives.
+        /// Called by RoomScanner when scanning starts. If the scene-understanding
+        /// permission is not yet granted, capture starts when it arrives.
         /// </summary>
         public void StartDepthCapture()
         {
             _captureActive = true;
+            ResetRateWindow();
             ApplyCaptureState();
             if (_permissionReady && _arOcclusionManager != null)
                 Logger.Info("DepthCapture: subsystem started");
             else
-                Logger.Info("DepthCapture: queued until USE_SCENE is granted");
+                Logger.Info($"DepthCapture: queued until {AndroidRuntimePermission.Scene} is granted");
         }
 
         /// <summary>
         /// Unsubscribes from depth frames and disables the AROcclusionManager,
-        /// stopping the depth sensor and neural inference pipeline on Quest.
-        /// Called by RoomScanner when scanning stops.
+        /// stopping the headset depth sensor. Called by RoomScanner when
+        /// scanning stops.
         /// </summary>
         public void StopDepthCapture()
         {
@@ -432,6 +495,7 @@ namespace Genesis.RoomScan
             if (_dilationB) { Destroy(_dilationB); _dilationB = null; }
             if (_simulatedDepthTex) { Destroy(_simulatedDepthTex); _simulatedDepthTex = null; }
             if (_filteredDepthTex) { Destroy(_filteredDepthTex); _filteredDepthTex = null; }
+            if (_linearDepthNdcTex) { Destroy(_linearDepthNdcTex); _linearDepthNdcTex = null; }
             _dilatedDepth = null;
             Logger.Info("DepthCapture: GPU resources released");
         }
@@ -440,7 +504,7 @@ namespace Genesis.RoomScan
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
             if (_started && !_permissionReady &&
-                Permission.HasUserAuthorizedPermission(ScenePermission))
+                Permission.HasUserAuthorizedPermission(AndroidRuntimePermission.Scene))
             {
                 MarkScenePermissionReady();
                 ApplyCaptureState();
@@ -448,21 +512,49 @@ namespace Genesis.RoomScan
 #endif
             if (!_captureActive) return;
             float t = Time.unscaledTime;
-            if (t - _lastLogTime >= 5f)
+            float window = t - _lastLogTime;
+            if (window >= 5f)
             {
-                _lastLogTime = t;
+                // events/s counts every frameReceived; newDepth/s counts distinct
+                // depth timestamps (Android XR re-delivers the last frame every
+                // render frame, so the second number is the real sensor rate).
+                float eventRate = (_frameCount - _logFrameCount) / window;
+                float newRate = (_newDepthFrameCount - _logNewDepthFrameCount) / window;
+                ResetRateWindow();
+
                 var sub = _arOcclusionManager != null ? _arOcclusionManager.subsystem : null;
-                Logger.Info($"DepthCapture: frames={_frameCount}, depthAvail={DepthAvailable}, " +
+                var src = _sourceDepthTex;
+                string srcInfo = src != null
+                    ? $"{src.width}x{src.height}x{SliceCount(src)} {src.graphicsFormat}"
+                    : "none";
+                Logger.Info($"DepthCapture: path={_encoding}, src={srcInfo}, events={eventRate:F1}/s, " +
+                          $"newDepth={newRate:F1}/s, frames={_frameCount}, depthAvail={DepthAvailable}, " +
                           $"occMgr.enabled={_arOcclusionManager?.enabled}, sub={sub?.GetType().Name ?? "null"}, " +
                           $"running={sub?.running}");
+
+                if (_encoding == DepthEncoding.LinearMetres && src != null)
+                    RequestDepthRowSample(src);
             }
+        }
+
+        private void ResetRateWindow()
+        {
+            _lastLogTime = Time.unscaledTime;
+            _logFrameCount = _frameCount;
+            _logNewDepthFrameCount = _newDepthFrameCount;
         }
 
         private void OnDepthFrame(AROcclusionFrameEventArgs args)
         {
             _frameCount++;
             if (_frameCount <= 3 || _frameCount % 100 == 0)
-                Logger.Info($"OnDepthFrame #{_frameCount}, textures={args.externalTextures.Count}");
+                Logger.Info($"OnDepthFrame #{_frameCount}, textures={args.externalTextures?.Count ?? 0}");
+
+            if (!args.TryGetTimestamp(out long timestamp) || timestamp != _lastDepthTimestamp)
+            {
+                _newDepthFrameCount++;
+                _lastDepthTimestamp = timestamp;
+            }
 
             if (Application.isEditor)
                 HandleEditorSimulation(args);
@@ -492,7 +584,7 @@ namespace Genesis.RoomScan
 
         private void HandleEditorSimulation(AROcclusionFrameEventArgs args)
         {
-            Texture rawDepth = args.externalTextures[0].texture;
+            Texture rawDepth = FirstTexture(args);
             DepthAvailable = rawDepth != null;
             if (!DepthAvailable) return;
 
@@ -535,27 +627,113 @@ namespace Genesis.RoomScan
             _planes = new Vector2(_mainCam.nearClipPlane, _mainCam.farClipPlane);
         }
 
+        private static Texture FirstTexture(AROcclusionFrameEventArgs args)
+        {
+            var textures = args.externalTextures;
+            return textures != null && textures.Count > 0 ? textures[0].texture : null;
+        }
+
+        private static bool HasEnabledKeyword(XRShaderKeywords keywords, string keyword)
+        {
+            var enabled = keywords.enabledKeywords;
+            if (enabled is null) return false;
+            for (int i = 0; i < enabled.Count; i++)
+                if (string.Equals(enabled[i], keyword, StringComparison.Ordinal))
+                    return true;
+            return false;
+        }
+
+        private static int SliceCount(Texture tex) => tex switch
+        {
+            RenderTexture rt => rt.dimension == TextureDimension.Tex2DArray ? rt.volumeDepth : 1,
+            Texture2DArray array => array.depth,
+            _ => 1
+        };
+
+        /// <summary>
+        /// Near/far the fork encodes linear depth with. Chosen here rather than
+        /// taken from the frame: the Android XR provider reports Camera.main's
+        /// clip planes (0/0 when there is no MainCamera), which have nothing to
+        /// do with the depth data. Far stays finite so NDC 1 decodes to a point.
+        /// </summary>
+        private XRNearFarPlanes LinearDepthPlanes()
+        {
+            float near = Mathf.Max(0.01f, linearDepthNear);
+            float far = Mathf.Clamp(linearDepthFar, near + 0.1f, 1000f);
+            return new XRNearFarPlanes(near, far);
+        }
+
+        private static bool ArePlanesUsable(XRNearFarPlanes planes) =>
+            planes.nearZ > 0f && (float.IsPositiveInfinity(planes.farZ) || planes.farZ > planes.nearZ);
+
         private void HandleDeviceDepth(AROcclusionFrameEventArgs args)
         {
-            _depthTex = args.externalTextures[0].texture;
+            DepthAvailable = false;
 
-            ReadOnlyList<XRFov> fovs = default;
-            ReadOnlyList<Pose> poses = default;
-            XRNearFarPlanes depthPlanes = default;
+            Texture src = FirstTexture(args);
+            _sourceDepthTex = src;
+            if (src == null)
+            {
+                if (!_loggedNoDepthTexture)
+                {
+                    _loggedNoDepthTexture = true;
+                    Logger.Warning($"DepthCapture: depth frame has no depth texture " +
+                                   $"(externalTextures={args.externalTextures?.Count ?? 0}); waiting");
+                }
+                return;
+            }
 
-            DepthAvailable = _depthTex != null &&
-                             args.TryGetFovs(out fovs) &&
-                             args.TryGetPoses(out poses) &&
-                             args.TryGetNearFarPlanes(out depthPlanes);
+            if (!args.TryGetFovs(out ReadOnlyList<XRFov> fovs) || fovs == null || fovs.Count == 0 ||
+                !args.TryGetPoses(out ReadOnlyList<Pose> poses) || poses == null || poses.Count == 0)
+            {
+                if (!_loggedNoViews)
+                {
+                    _loggedNoViews = true;
+                    Logger.Warning("DepthCapture: depth frame has no per-eye FOVs/poses; waiting");
+                }
+                return;
+            }
 
-            if (!DepthAvailable) return;
+            args.TryGetNearFarPlanes(out XRNearFarPlanes providerPlanes);
+            bool linear = HasEnabledKeyword(args.shaderKeywords, LinearDepthKeyword);
+            _encoding = linear ? DepthEncoding.LinearMetres : DepthEncoding.ProviderNdc;
+
+            // Linear metres (Android XR): encode with the fork's own planes so the
+            // conversion and the projection below agree regardless of Camera.main.
+            // Provider NDC: the texture was encoded with the provider's planes, so
+            // only those decode it.
+            XRNearFarPlanes depthPlanes = linear ? LinearDepthPlanes() : providerPlanes;
+            if (!linear && !ArePlanesUsable(depthPlanes))
+            {
+                if (!_loggedBadPlanes)
+                {
+                    _loggedBadPlanes = true;
+                    Logger.Warning($"DepthCapture: provider NDC depth with unusable near/far " +
+                                   $"({depthPlanes.nearZ}, {depthPlanes.farZ}); skipping frames");
+                }
+                return;
+            }
+
+            if (_loggedEncoding != _encoding)
+            {
+                _loggedEncoding = _encoding;
+                string srcInfo = $"{src.width}x{src.height}x{SliceCount(src)} {src.graphicsFormat} {src.dimension}";
+                if (linear)
+                    Logger.Info($"DepthCapture: depth path = {LinearDepthKeyword} linear metres -> NDC " +
+                                $"(near={depthPlanes.nearZ:F2} m, far={depthPlanes.farZ:F1} m, flipY={flipLinearDepthY}; " +
+                                $"provider near/far {providerPlanes.nearZ}/{providerPlanes.farZ} ignored), src={srcInfo}");
+                else
+                    Logger.Info($"DepthCapture: depth path = provider NDC (no {LinearDepthKeyword}), " +
+                                $"near={depthPlanes.nearZ} far={depthPlanes.farZ}, src={srcInfo}");
+            }
 
             for (int i = 0; i < 2; i++)
             {
-                _proj[i] = CalculateProjectionMatrix(fovs[i], depthPlanes);
+                // A provider with a single view feeds both eyes from it.
+                _proj[i] = CalculateProjectionMatrix(fovs[Mathf.Min(i, fovs.Count - 1)], depthPlanes);
                 _projInv[i] = Matrix4x4.Inverse(_proj[i]);
 
-                Pose pose = poses[i];
+                Pose pose = poses[Mathf.Min(i, poses.Count - 1)];
                 Matrix4x4 depthFrameMat = Matrix4x4.TRS(pose.position, pose.rotation, ScaleFlipZ);
 
                 Matrix4x4 worldToTracking = _trackingSpaceTransform != null
@@ -566,7 +744,163 @@ namespace Genesis.RoomScan
                 _viewInv[i] = Matrix4x4.Inverse(_view[i]);
             }
 
+            if (linear)
+            {
+                if (!ConvertLinearDepth(src, depthPlanes)) return;
+            }
+            else
+            {
+                _depthTex = src;
+            }
+
             _planes = new Vector2(depthPlanes.nearZ, depthPlanes.farZ);
+            DepthAvailable = true;
+        }
+
+        /// <summary>
+        /// Re-encodes the provider's linear-metre Tex2DArray into NDC (R32_SFloat,
+        /// same size, 2 slices) with the LinearDepthToNDC kernel. Runs before the
+        /// bilateral filter so its R16_UNorm output and every decoder downstream
+        /// only ever see NDC. The encode uses _proj[0]'s m22/m23, so it is the
+        /// exact inverse of gsDepthNDCToLinear for this frame.
+        /// </summary>
+        private bool ConvertLinearDepth(Texture src, XRNearFarPlanes planes)
+        {
+            if (src.dimension != TextureDimension.Tex2DArray)
+            {
+                if (!_loggedBadDimension)
+                {
+                    _loggedBadDimension = true;
+                    Logger.Error($"DepthCapture: linear depth texture is {src.dimension}, expected Tex2DArray; " +
+                                 "depth disabled");
+                }
+                return false;
+            }
+
+            int w = src.width;
+            int h = src.height;
+            if (_linearDepthNdcTex == null || _linearDepthNdcTex.width != w || _linearDepthNdcTex.height != h)
+            {
+                if (_linearDepthNdcTex) Destroy(_linearDepthNdcTex);
+                _linearDepthNdcTex = new RenderTexture(w, h, 0, GraphicsFormat.R32_SFloat, 1)
+                {
+                    name = "RoomScan Linear Depth NDC",
+                    dimension = TextureDimension.Tex2DArray,
+                    volumeDepth = 2,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                _linearDepthNdcTex.Create();
+            }
+
+            var cs = depthNormalCompute;
+            cs.SetVector(LinearDepthNdcParamsID,
+                new Vector4(_proj[0].m22, _proj[0].m23, planes.nearZ, planes.farZ));
+            cs.SetVector(LinearDepthInfoID,
+                new Vector4(w, h, SliceCount(src), flipLinearDepthY ? 1f : 0f));
+            cs.SetVector(LinearDepthInfo2ID, new Vector4(carveOnInfiniteDepth ? 1f : 0f, 0f, 0f, 0f));
+            _linearToNdcKernel.Set(InputLinearDepthID, src);
+            _linearToNdcKernel.Set(DepthTexRWID, _linearDepthNdcTex);
+            _linearToNdcKernel.DispatchFit(w, h, 2);
+
+            _depthTex = _linearDepthNdcTex;
+            return true;
+        }
+
+        /// <summary>
+        /// Reads back eye 0 of the linear source (asynchronously, every ~5 s) and
+        /// logs the middle row's valid range in metres plus an orientation probe:
+        /// the mean depth of the lowest and highest quarter of rows, with the head
+        /// pitch at request time. Looking down at a floor, the bottom of the view
+        /// is nearer, so this settles <see cref="flipLinearDepthY"/> from one log.
+        /// </summary>
+        private void RequestDepthRowSample(Texture src)
+        {
+            if (_rowReadbackPending || !SystemInfo.supportsAsyncGPUReadback) return;
+            _rowSampleY = src.height / 2;
+            _rowSampleHeight = src.height;
+            _rowSampleWidth = src.width;
+            _rowSamplePitch = 0f;
+            var cam = _mainCam ? _mainCam : Camera.main;
+            if (cam)
+            {
+                // Positive = looking down.
+                float x = cam.transform.eulerAngles.x;
+                _rowSamplePitch = x > 180f ? x - 360f : x;
+            }
+            _rowReadbackPending = true;
+            AsyncGPUReadback.Request(src, 0, 0, src.width, 0, src.height, 0, 1, OnDepthRowReadback);
+        }
+
+        private void OnDepthRowReadback(AsyncGPUReadbackRequest request)
+        {
+            _rowReadbackPending = false;
+            if (this == null || request.hasError) return;
+
+            var data = request.GetData<float>();
+            int w = _rowSampleWidth, h = _rowSampleHeight;
+            if (w <= 0 || h <= 0 || data.Length < w * h) return;
+
+            int valid = 0, zero = 0, posInf = 0, other = 0;
+            float min = float.PositiveInfinity, max = 0f;
+            int rowStart = _rowSampleY * w;
+            for (int i = rowStart; i < rowStart + w; i++)
+            {
+                float m = data[i];
+                if (m == 0f) zero++;
+                else if (float.IsPositiveInfinity(m)) posInf++;
+                else if (float.IsNaN(m) || m < 0f) other++;
+                else
+                {
+                    valid++;
+                    if (m < min) min = m;
+                    if (m > max) max = m;
+                }
+            }
+
+            string range = valid > 0 ? $"min={min:F2} m, max={max:F2} m" : "no valid pixels";
+            Logger.Info($"DepthCapture: linear depth row {_rowSampleY}/{h} (eye 0): " +
+                        $"valid={valid}/{w}, {range}, zero={zero}, +inf={posInf}, other={other}");
+
+            // Orientation probe. Raw row 0 is what the pipeline treats as the
+            // bottom of the view when flipLinearDepthY is off (uv v=0 -> NDC y=-1).
+            int quarter = Mathf.Max(1, h / 4);
+            float lowMean = MeanValidDepth(data, w, 0, quarter);
+            float highMean = MeanValidDepth(data, w, h - quarter, h);
+            string hint;
+            if (_rowSamplePitch < 25f)
+                hint = "look down at the floor (pitch > 25) for a flip suggestion";
+            else if (float.IsNaN(lowMean) || float.IsNaN(highMean))
+                hint = "not enough valid depth for a flip suggestion";
+            else
+            {
+                // The true bottom of the view is nearer when looking at a floor.
+                bool rawRow0IsBottom = lowMean < highMean;
+                bool suggestFlip = !rawRow0IsBottom;
+                hint = suggestFlip == flipLinearDepthY
+                    ? $"current flipLinearDepthY={flipLinearDepthY} looks correct"
+                    : $"set flipLinearDepthY={suggestFlip} (depth looks upside down)";
+            }
+            Logger.Info($"DepthCapture: orientation probe pitch={_rowSamplePitch:F0} deg, " +
+                        $"raw rows 0..{quarter - 1} mean={lowMean:F2} m, rows {h - quarter}..{h - 1} mean={highMean:F2} m -> {hint}");
+        }
+
+        private static float MeanValidDepth(Unity.Collections.NativeArray<float> data, int w, int rowFrom, int rowTo)
+        {
+            double sum = 0;
+            int n = 0;
+            for (int y = rowFrom; y < rowTo; y++)
+            for (int x = 0; x < w; x++)
+            {
+                float m = data[y * w + x];
+                if (m > 0f && !float.IsInfinity(m) && !float.IsNaN(m))
+                {
+                    sum += m;
+                    n++;
+                }
+            }
+            return n > (rowTo - rowFrom) * w / 10 ? (float)(sum / n) : float.NaN;
         }
 
         private bool _loggedBilateralSkip;
@@ -697,10 +1031,16 @@ namespace Genesis.RoomScan
 
         private static Matrix4x4 CalculateProjectionMatrix(XRFov fov, XRNearFarPlanes planes)
         {
-            float left = Mathf.Tan(fov.angleLeft);
-            float right = Mathf.Tan(fov.angleRight);
-            float bottom = Mathf.Tan(fov.angleDown);
-            float top = Mathf.Tan(fov.angleUp);
+            // OpenXR's XrFovf is signed (left/down negative for a centred view),
+            // which the raw tan() here used to rely on. AR Foundation's own
+            // ARShaderOcclusion instead builds -|left|, |right|, -|down|, |up|,
+            // so a provider may legally report magnitudes. Normalising the signs
+            // gives the same frustum under either convention (it assumes each
+            // depth view contains its optical axis, as ARShaderOcclusion does).
+            float left = Mathf.Tan(-Mathf.Abs(fov.angleLeft));
+            float right = Mathf.Tan(Mathf.Abs(fov.angleRight));
+            float bottom = Mathf.Tan(-Mathf.Abs(fov.angleDown));
+            float top = Mathf.Tan(Mathf.Abs(fov.angleUp));
 
             float near = planes.nearZ;
             float far = planes.farZ;

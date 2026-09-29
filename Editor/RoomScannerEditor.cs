@@ -17,7 +17,7 @@ namespace Genesis.RoomScan.Editor
     {
         static readonly (string label, Type type, Type[] extraDeps, bool triggerXAtlasBuild)[] ModuleOptions =
         {
-            ("Passthrough Camera", typeof(PassthroughCameraProvider), new[] { typeof(UnityEngine.XR.ARFoundation.ARCameraManager) }, false),
+            ("Passthrough Camera", typeof(PassthroughCameraProvider), null, false),
             ("Triplanar Cache", typeof(TriplanarCache), null, false),
             ("Texture Refinement", typeof(TextureRefinement), null, true),
             ("Input Handler", typeof(RoomScanInputHandler), null, false),

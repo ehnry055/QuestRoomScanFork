@@ -19,13 +19,36 @@ namespace Genesis.RoomScan
     /// their own UX; <see cref="RoomScanner.StartScanningAsync"/> asks again
     /// for whatever is still missing, which is free once granted.
     /// </para>
+    /// <para>
+    /// The ids are Android XR's (Samsung Galaxy XR). Every one of them is a
+    /// runtime ("dangerous") permission, and a request for one the merged
+    /// manifest does not declare is denied at once with no dialog. The
+    /// Android XR OpenXR build step declares the scene-understanding and
+    /// hand-tracking ones; Unity declares <see cref="Camera"/> when a script
+    /// uses <c>WebCamTexture</c>.
+    /// </para>
     /// Always resolves granted outside Android device builds. Main thread only.
     /// </summary>
     internal static class AndroidRuntimePermission
     {
-        public const string Scene = "com.oculus.permission.USE_SCENE";
-        public const string Anchors = "com.oculus.permission.USE_ANCHOR_API";
-        public const string Camera = "horizonos.permission.HEADSET_CAMERA";
+        /// <summary>Fine scene understanding: the environment depth
+        /// (<c>XR_ANDROID_depth_texture</c>) the scan is built from.
+        /// Required; without it there is no scan.</summary>
+        public const string Scene = "android.permission.SCENE_UNDERSTANDING_FINE";
+
+        /// <summary>Coarse scene understanding: anchors (and anchor
+        /// persistence), planes and light estimation. Optional.</summary>
+        public const string Anchors = "android.permission.SCENE_UNDERSTANDING_COARSE";
+
+        /// <summary>The standard Android camera permission, for the
+        /// world-facing RGB camera (Camera2 id 0) that
+        /// <see cref="PassthroughCameraProvider"/> opens. Optional: the scan
+        /// runs depth-only without it.</summary>
+        public const string Camera = "android.permission.CAMERA";
+
+        /// <summary>Android XR hand tracking (XR Hands joints, hand
+        /// interaction profile). Optional.</summary>
+        public const string HandTracking = "android.permission.HAND_TRACKING";
 
         public static bool Has(string permissionId)
         {
@@ -33,6 +56,24 @@ namespace Genesis.RoomScan
             return Permission.HasUserAuthorizedPermission(permissionId);
 #else
             return true;
+#endif
+        }
+
+        /// <summary>
+        /// True when a request for <paramref name="permissionId"/> made
+        /// through this class was answered "deny" earlier in this process
+        /// and the permission is still not granted. Lets a second caller
+        /// (e.g. a camera provider starting after the scan-start requests)
+        /// skip asking again straight after the user said no. Always false
+        /// outside Android device builds.
+        /// </summary>
+        public static bool DeniedThisSession(string permissionId)
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            return _denied.Contains(permissionId)
+                && !Permission.HasUserAuthorizedPermission(permissionId);
+#else
+            return false;
 #endif
         }
 
@@ -50,6 +91,9 @@ namespace Genesis.RoomScan
         // In-flight request per permission id, so concurrent callers for the
         // same permission share one dialog.
         static readonly Dictionary<string, Task<bool>> _pending = new();
+
+        // Ids the user denied this process (see DeniedThisSession).
+        static readonly HashSet<string> _denied = new();
 #endif
 
         public static Task<bool> RequestAsync(string permissionId)
@@ -109,6 +153,8 @@ namespace Genesis.RoomScan
             if (!tcs.TrySetResult(granted)) return;
             _pending.Remove(permissionId);
             _heldCallbacks = null;
+            if (granted) _denied.Remove(permissionId);
+            else _denied.Add(permissionId);
             Logger.Info($"Permission {(granted ? "granted" : "denied")}: {permissionId}");
         }
 #endif

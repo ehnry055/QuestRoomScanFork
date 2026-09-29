@@ -170,6 +170,13 @@ namespace Genesis.RoomScan
         [Header("Logging")]
         [SerializeField] private LogLevel logLevel = LogLevel.Info;
 
+        [Header("Passthrough")]
+        [SerializeField, Tooltip(
+            "Enable the scene's ARCameraManager at startup. On Android XR that component " +
+            "is what turns passthrough on (it delivers no camera images). The package " +
+            "never disables it. Turn off only for a host that manages passthrough itself.")]
+        private bool keepPassthroughOn = true;
+
         [Header("Scan Priors")]
         [SerializeField, Tooltip(
             "When true, TSDF stays inside the MRUK room that contained " +
@@ -303,7 +310,7 @@ namespace Genesis.RoomScan
         public DepthCapture DepthCapture => _depthCapture;
         /// <summary>The core mesh extractor component.</summary>
         public MeshExtractor MeshExtractor => _meshExtractor;
-        /// <summary>The active camera provider (custom or passthrough).</summary>
+        /// <summary>The active camera provider (custom, else the sibling <see cref="PassthroughCameraProvider"/>), or null.</summary>
         public ICameraProvider ActiveCameraProvider => GetActiveCameraProvider();
         /// <summary>The optional Gaussian Splat provider, or null if the GSplat module is not attached.</summary>
         public IGSplatProvider GSplatProvider => _gsplatProvider;
@@ -321,8 +328,9 @@ namespace Genesis.RoomScan
         public event Action<Mesh, Texture2D> RefinedMeshReady;
 
         /// <summary>
-        /// Raised each frame a passthrough camera frame is fed to the volume integrator.
-        /// Parameters: frame texture, camera pose, focal length, principal point, sensor resolution, current resolution.
+        /// Raised each time an RGB camera frame is fed to the volume integrator.
+        /// Parameters: frame texture, world-space camera pose, focal length, principal point,
+        /// sensor resolution, current resolution (conventions: <see cref="ICameraProvider"/>).
         /// </summary>
         public event Action<Texture, Pose, Vector2, Vector2, Vector2, Vector2> ColorFrameProvided;
 
@@ -336,6 +344,11 @@ namespace Genesis.RoomScan
         // ─────────────────────────────────────────────────────────────
 
         private float _lastIntegrationTime;
+        // DepthCapture.DepthFrameSerial at the last integration. Android XR
+        // re-delivers its last depth frame (~6-7 Hz sensor) every render
+        // frame; integrating only on a new serial keeps each depth frame
+        // from being fused several times.
+        private int _lastIntegratedDepthSerial = -1;
         private float _lastMeshTime;
         private bool _started;
         private bool _serverTrainingInProgress;
@@ -446,6 +459,8 @@ namespace Genesis.RoomScan
                 return;
             }
 
+            if (keepPassthroughOn) EnsurePassthroughOn();
+
             _modules = GetComponents<IRoomScanModule>();
             foreach (var m in _modules) m.OnModuleInitialize(this);
 
@@ -475,6 +490,31 @@ namespace Genesis.RoomScan
             if (_started)
                 return;
             CompleteRoomStartup();
+        }
+
+        /// <summary>
+        /// Enables every disabled <c>ARCameraManager</c> on an active object.
+        /// On Android XR the camera subsystem only switches passthrough on and
+        /// off, so a disabled manager (scenes set up by the older wizard keep
+        /// it off between scans) leaves the headset showing the clear colour
+        /// instead of the room. Nothing in the package disables it again.
+        /// </summary>
+        private static void EnsurePassthroughOn()
+        {
+            var managers = FindObjectsByType<UnityEngine.XR.ARFoundation.ARCameraManager>(
+                FindObjectsInactive.Exclude);
+            if (managers.Length == 0)
+            {
+                Logger.Warning("No ARCameraManager in the scene — passthrough stays off. " +
+                               "Add one to the XR Origin's camera.");
+                return;
+            }
+            foreach (var m in managers)
+            {
+                if (m.enabled) continue;
+                m.enabled = true;
+                Logger.Info($"Passthrough: enabled ARCameraManager on '{m.gameObject.name}'.");
+            }
         }
 
         private void CacheComponents()
@@ -556,9 +596,12 @@ namespace Genesis.RoomScan
 
             float t = Time.time;
 
-            if (t - _lastIntegrationTime >= IntegrationInterval)
+            int depthSerial = _depthCapture != null ? _depthCapture.DepthFrameSerial : -1;
+            if (t - _lastIntegrationTime >= IntegrationInterval
+                && (depthSerial < 0 || depthSerial != _lastIntegratedDepthSerial))
             {
                 _lastIntegrationTime = t;
+                _lastIntegratedDepthSerial = depthSerial;
 
                 RefreshBodyAnchors();
                 ProvideColorFrame();
@@ -612,12 +655,15 @@ namespace Genesis.RoomScan
         ///
         /// <para>
         /// <b>Permissions are requested here</b>, in sequence, for whatever is
-        /// still missing: <c>USE_SCENE</c> (required — a denial aborts the
-        /// start), then <c>HEADSET_CAMERA</c> and <c>USE_ANCHOR_API</c> (a
-        /// denial degrades). Hosts that want the dialogs at boot for UX call
+        /// still missing: <c>SCENE_UNDERSTANDING_FINE</c> (environment depth;
+        /// required — a denial aborts the start), then <c>CAMERA</c> (only
+        /// when a camera provider is present), <c>SCENE_UNDERSTANDING_COARSE</c>
+        /// (anchors) and <c>HAND_TRACKING</c> (a denial of any of these
+        /// degrades). Hosts that want the dialogs at boot for UX call
         /// <see cref="RoomScanSession.RequestScenePermissionAsync"/> and
-        /// friends first; the requests here are then no-ops. Nothing else in
-        /// the package calls <c>RequestUserPermission</c>.
+        /// friends first; the requests here are then no-ops. Every request
+        /// goes through the one serialized queue in
+        /// <c>AndroidRuntimePermission</c>.
         /// </para>
         ///
         /// <para>
@@ -626,17 +672,17 @@ namespace Genesis.RoomScan
         /// frames: allocate the volumes, yield twice so the render thread
         /// commits them and runs the first Clear, allocate the mesh
         /// extractor, yield twice again, then switch to the live preview
-        /// and enable PCA + AROcclusionManager. Total wall-clock on a
-        /// Quest 3 is ~56 ms (4 frames at 72 fps), below the threshold at
-        /// which a press feels unregistered. Allocating 600 MB and opening
-        /// two camera pipelines in a single frame is a worst case for the
-        /// render thread that the staging avoids.
+        /// and start the RGB camera + AROcclusionManager. Total wall-clock
+        /// is about four app frames (under 60 ms at 72 fps or faster), below
+        /// the threshold at which a press feels unregistered. Allocating 600 MB
+        /// and opening two camera pipelines in a single frame is a worst
+        /// case for the render thread that the staging avoids.
         /// </para>
         ///
         /// <para>
         /// History: a multi-second "hang on the first A-press" was once
-        /// attributed to this timing (PCA's MRUK handshake losing a race
-        /// to the compute dispatches). The measured cause was different —
+        /// attributed to this timing (the camera's native start losing a
+        /// race to the compute dispatches). The measured cause was different —
         /// <see cref="GPUSurfaceNets"/> drew from an indirect-args buffer
         /// that nothing had written yet, and whether that garbage happened
         /// to be zero depended on what the host had just freed. Eager
@@ -650,10 +696,11 @@ namespace Genesis.RoomScan
             if (IsScanning || _startingScan) return;
 
             // Permissions first, before anything is torn down or allocated:
-            // the user may take a while on the dialogs, and a denied USE_SCENE
-            // means there is no scan to start. Requests are serialised inside
-            // AndroidRuntimePermission and free once granted, so a host that
-            // already asked at boot pays nothing here.
+            // the user may take a while on the dialogs, and a denied
+            // SCENE_UNDERSTANDING_FINE (no depth) means there is no scan to
+            // start. Requests are serialised inside AndroidRuntimePermission
+            // and free once granted, so a host that already asked at boot
+            // pays nothing here.
             _startingScan = true;
             try
             {
@@ -670,22 +717,28 @@ namespace Genesis.RoomScan
         private bool _startingScan;
 
         /// <summary>
-        /// USE_SCENE is required (no depth, no scan). HEADSET_CAMERA and
-        /// USE_ANCHOR_API are requested too but a denial only degrades:
-        /// depth-only colour from normals, and a save without a spatial
-        /// anchor (floor-anchor relocation fallback).
+        /// SCENE_UNDERSTANDING_FINE is required (no depth, no scan). CAMERA,
+        /// SCENE_UNDERSTANDING_COARSE and HAND_TRACKING are requested too but
+        /// a denial only degrades: depth-only colour from normals, a save
+        /// without a spatial anchor (floor-anchor relocation fallback), and
+        /// no tracked hands. CAMERA is skipped when there is no camera
+        /// provider to use it.
         /// </summary>
         private async Task<bool> EnsureScanPermissionsAsync()
         {
             if (!await AndroidRuntimePermission.RequestAsync(AndroidRuntimePermission.Scene))
             {
-                Logger.Error("USE_SCENE denied — the depth sensor is required to scan. Not starting.");
+                Logger.Error("SCENE_UNDERSTANDING_FINE denied — environment depth is required to scan. Not starting.");
                 return false;
             }
-            if (!await AndroidRuntimePermission.RequestAsync(AndroidRuntimePermission.Camera))
-                Logger.Warning("HEADSET_CAMERA denied — scanning depth-only; vertex colour falls back to normals.");
+            if (GetActiveCameraProvider() == null)
+                Logger.Info("No camera provider — not requesting CAMERA; scanning depth-only.");
+            else if (!await AndroidRuntimePermission.RequestAsync(AndroidRuntimePermission.Camera))
+                Logger.Warning("CAMERA denied — scanning depth-only; vertex colour falls back to normals.");
             if (!await AndroidRuntimePermission.RequestAsync(AndroidRuntimePermission.Anchors))
-                Logger.Warning("USE_ANCHOR_API denied — this scan will save without a spatial anchor.");
+                Logger.Warning("SCENE_UNDERSTANDING_COARSE denied — this scan will save without a spatial anchor.");
+            if (!await AndroidRuntimePermission.RequestAsync(AndroidRuntimePermission.HandTracking))
+                Logger.Warning("HAND_TRACKING denied — no tracked hands (hand input and hand exclusion unavailable).");
             return true;
         }
 
@@ -745,10 +798,9 @@ namespace Genesis.RoomScan
                 }
 
                 // Yield twice so the render thread can commit the ~480 MB
-                // ComputeBuffers + cell-table upload before PCA enables.
-                // This is the critical pair — without it, PCA's native
-                // OnEnable lands in the same frame as the first Surface
-                // Nets dispatch and the MRUK fence handshake fails.
+                // ComputeBuffers + cell-table upload before the camera and
+                // depth pipelines start, so their native start-up does not
+                // land in the same frame as the first Surface Nets dispatch.
                 await Task.Yield();
                 await Task.Yield();
 
@@ -776,16 +828,21 @@ namespace Genesis.RoomScan
 
                 float t = Time.time;
                 _lastIntegrationTime = t;
+                _lastIntegratedDepthSerial = -1;
                 _lastMeshTime = t;
 
-                _cameraAvailable = false;
+                // Re-evaluate the normal-colour fallback on the first
+                // colour tick of this scan (see ProvideColorFrame).
+                _normalFallbackApplied = -1;
+                _lastColorFrameTime = double.NaN;
 
                 // ── Stage 4: camera + depth (now safe) ──────────────────
-                // PCA's native OnEnable handshakes with MRUK to grab the
-                // passthrough hardware buffer queue. By this point the
-                // GPU resources are committed and the render-thread queue
-                // is clean, so PCA can win the handshake and MRUK keeps
-                // pulling frames steadily.
+                // By this point the GPU resources are committed and the
+                // render-thread queue is clean. The RGB camera (Camera2 via
+                // WebCamTexture) opens asynchronously and may deliver its
+                // first frame some ticks later; depth starts through
+                // AROcclusionManager. Passthrough (ARCameraManager) is not
+                // touched here — it stays on for the app's lifetime.
                 ICameraProvider provider = GetActiveCameraProvider();
                 provider?.StartCapture();
                 _depthCapture.StartDepthCapture();
@@ -909,7 +966,7 @@ namespace Genesis.RoomScan
         /// Drops the in-memory loaded / refined scan so the next
         /// <see cref="StartScanningAsync"/> is an empty-room start. Does
         /// <b>not</b> delete saved packages or erase spatial-anchor UUIDs
-        /// from Horizon OS — use <see cref="RoomScanPersistence.DeletePackageAsync"/>
+        /// from the platform anchor store — use <see cref="RoomScanPersistence.DeletePackageAsync"/>
         /// for that.
         /// <para>
         /// Hides the refined mesh, unbinds the active spatial anchor
@@ -992,7 +1049,7 @@ namespace Genesis.RoomScan
         /// Clears all persisted data: in-memory scan, saved scan files, triplanar
         /// textures, and temporary package. Safe to call at runtime.
         /// File I/O runs on a background thread via ThreadPool to avoid main-thread
-        /// stalls and potential SynchronizationContext deadlocks on Quest/IL2CPP.
+        /// stalls and potential SynchronizationContext deadlocks on Android/IL2CPP.
         /// GPU resources are disposed without immediate re-allocation to avoid
         /// Vulkan stalls when the GPU is still referencing the previous frame's buffers.
         /// Re-initialization happens lazily on the next <see cref="StartScanningAsync"/> or load.
@@ -1117,8 +1174,8 @@ namespace Genesis.RoomScan
         /// <summary>
         /// Freezes voxels inside the default spotlight cone in front of the
         /// head (see <see cref="FreezeConeHalfAngle"/>). Uses the head pose,
-        /// which is always available — not the passthrough camera, whose
-        /// intrinsics were not. Hosts that have their own emitter can call
+        /// which is always available — not the RGB camera, which may be
+        /// absent and whose intrinsics are estimated. Hosts that have their own emitter can call
         /// the overload with origin, axis, half-angle, and length.
         /// </summary>
         public void FreezeInView()
@@ -1237,7 +1294,10 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// Set a custom camera provider (overrides PassthroughCameraProvider).
+        /// Set a custom camera provider (overrides the sibling
+        /// <see cref="PassthroughCameraProvider"/>). Call before
+        /// <see cref="StartScanningAsync"/>; its <see cref="ICameraProvider.CameraPose"/>
+        /// must be world space.
         /// </summary>
         public void SetCameraProvider(ICameraProvider provider)
         {
@@ -1921,8 +1981,8 @@ namespace Genesis.RoomScan
 
         /// <summary>
         /// Swap the refined mesh between two-sided (in-room) and Cull Back
-        /// (outside). Quest ignores ShaderLab <c>Cull [_Cull]</c>; this is a
-        /// second program, not a float.
+        /// (outside). The Android Vulkan path (seen on Adreno) ignores
+        /// ShaderLab <c>Cull [_Cull]</c>; this is a second program, not a float.
         /// </summary>
         internal void SetRefinedBackfaceCull(bool cullBack)
         {
@@ -2136,38 +2196,60 @@ namespace Genesis.RoomScan
         }
 
         private int _colorFrameLog;
-        private bool _cameraAvailable;
+        // Last value written to _RSNormalFallback by ProvideColorFrame:
+        // -1 = not written since the scan started (forces a write on the
+        // first colour tick, whatever an earlier scan or load left behind).
+        private int _normalFallbackApplied = -1;
+        // ICameraFrameTiming.FrameTimeSeconds of the last camera frame handed
+        // to integration; NaN = none yet this scan. Each frame is used once.
+        private double _lastColorFrameTime = double.NaN;
         private void ProvideColorFrame()
         {
             ICameraProvider provider = GetActiveCameraProvider();
 
-            // IsPlaying = camera subsystem running (stable signal).
+            // IsPlaying = camera running AND at least one frame delivered
+            // (stable signal; a camera that never delivers reads false).
             // IsReady = new frame available this tick (toggles at camera fps < app fps).
             bool cameraPlaying = provider != null && provider.IsPlaying;
 
-            if (cameraPlaying && !_cameraAvailable)
+            // New = a frame integration has not used yet. Colour is only fed
+            // on integration ticks, which follow new depth frames (~6-7 Hz on
+            // Android XR), so IsReady alone (arrived on this exact tick) would
+            // drop most frames. The provider holds the frame, pose and
+            // intrinsics fixed until its next arrival, so a frame from an
+            // earlier tick still pairs correctly. Behind IsPlaying: while not
+            // playing FrameTimeSeconds reads the current time, not a frame's.
+            var timing = provider as ICameraFrameTiming;
+            bool newFrame = timing != null
+                ? cameraPlaying && timing.FrameTimeSeconds != _lastColorFrameTime
+                : provider != null && provider.IsReady;
+
+            // Without camera frames the colour volume is never written, and
+            // the live mesh would render its empty (black) vertex colour —
+            // colour from normals instead.
+            int wantFallback = cameraPlaying ? 0 : 1;
+            if (wantFallback != _normalFallbackApplied)
             {
-                _cameraAvailable = true;
-                Shader.SetGlobalFloat(NormalFallbackID, 0f);
-                Logger.Info("Camera playing — disabling normal fallback");
-            }
-            else if (!cameraPlaying && (_cameraAvailable || _colorFrameLog == 0))
-            {
-                _cameraAvailable = false;
-                Shader.SetGlobalFloat(NormalFallbackID, 1f);
-                Logger.Info("Camera not playing — enabling normal fallback rendering");
+                _normalFallbackApplied = wantFallback;
+                Shader.SetGlobalFloat(NormalFallbackID, wantFallback);
+                Logger.Info(cameraPlaying
+                    ? "Camera playing — disabling normal fallback"
+                    : "Camera not playing — enabling normal fallback rendering");
             }
 
-            if (provider != null && provider.IsReady)
+            if (newFrame)
             {
                 Texture frame = provider.CurrentFrame;
                 if (frame != null)
                 {
+                    if (timing != null) _lastColorFrameTime = timing.FrameTimeSeconds;
                     _depthCapture?.SetRGBGuide(frame);
 
+                    // World space already (ICameraProvider contract). No
+                    // TrackingToWorld here: that is for depth poses, which
+                    // arrive in tracking space; applying it again double-
+                    // counts the XR Origin camera offset.
                     Pose pose = provider.CameraPose;
-                    if (_depthCapture != null)
-                        pose = _depthCapture.TrackingToWorld(pose);
                     Vector2 focal = provider.FocalLength;
                     Vector2 principal = provider.PrincipalPoint;
                     Vector2 sensor = provider.SensorResolution;
@@ -2192,7 +2274,7 @@ namespace Genesis.RoomScan
             _colorFrameLog++;
             if (_colorFrameLog <= 5)
                 Logger.Verbose($"ColorFrame #{_colorFrameLog}: NO FRAME " +
-                    $"playing={cameraPlaying}, " +
+                    $"playing={cameraPlaying}, newFrame={newFrame}, " +
                     $"isReady={provider?.IsReady ?? false}");
 
             _volumeIntegrator.SetCameraData(null, Vector3.zero, Quaternion.identity,

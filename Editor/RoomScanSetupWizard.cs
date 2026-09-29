@@ -53,9 +53,11 @@ namespace Genesis.RoomScan.Editor
         bool _depthCaptureWired, _volumeWired, _meshMatWired, _triplanarWired, _computeShaderWired;
         bool _refinedShaderWired, _occlusionShaderWired, _atlasBakeComputeWired;
         bool _debugOverlayWired;
-        bool _boundarylessManifest;
+        bool _androidXRManifest;
+        bool _questManifestLeftovers;
         bool _cleartextAllowed;
         bool _insecureHttpAllowed;
+        bool _xrCameraConfigured;
 
         // Style
         static readonly Color COL_OK   = new(0.25f, 0.82f, 0.35f);
@@ -96,7 +98,7 @@ namespace Genesis.RoomScan.Editor
             _arSession = FindAny<ARSession>();
             _arOcclusion = FindAny<AROcclusionManager>();
 
-            // Try to find camera rig — look for OVRCameraRig or XROrigin
+            // Camera rig = the XR Origin
             _cameraRig = null;
             var xrOrigin = FindAny<Unity.XR.CoreUtils.XROrigin>();
             if (xrOrigin != null)
@@ -149,9 +151,11 @@ namespace Genesis.RoomScan.Editor
 
             RefreshURPState();
 
-            _boundarylessManifest = ManifestHasAllQuestVREntries();
-            _cleartextAllowed = ManifestHasCleartextTraffic();
+            _androidXRManifest = AndroidXRManifestLibHasPermissions();
+            _questManifestLeftovers = MainManifestHasQuestEntries();
+            _cleartextAllowed = AndroidXRManifestLibHasCleartext();
             _insecureHttpAllowed = PlayerSettings.insecureHttpOption != InsecureHttpOption.NotAllowed;
+            _xrCameraConfigured = IsXRCameraConfigured(out _);
         }
 
         // Partial methods implemented in RoomScanSetupWizard.GSplat.cs when
@@ -173,7 +177,7 @@ namespace Genesis.RoomScan.Editor
         partial void SetupAIDetectionIfAvailable(GameObject root);
 
         // Partial methods implemented in RoomScanSetupWizard.VRProject.cs.
-        // Always present (no #if guard) because OpenXR + Meta XR are core deps.
+        // Always present (no #if guard) because OpenXR + Android XR are core deps.
         partial void RefreshVRProject();
         partial void DrawVRProjectSection();
 
@@ -230,13 +234,16 @@ namespace Genesis.RoomScan.Editor
             StatusRow("ARSession", _arSession != null);
             StatusRow("Camera Rig (XROrigin)", _cameraRig != null);
             StatusRow("AROcclusionManager", _arOcclusion != null);
+            if (_cameraRig != null)
+                StatusRow("XR camera (MainCamera tag, transparent clear, ARCameraManager on, Floor origin, no post-processing)",
+                          _xrCameraConfigured);
 
             if (!_urpConfigured)
             {
                 GUILayout.Space(2);
                 EditorGUILayout.BeginHorizontal();
                 GUILayout.FlexibleSpace();
-                if (GUILayout.Button("Setup URP (Quest defaults)", GUILayout.Width(220)))
+                if (GUILayout.Button("Setup URP (Android XR defaults)", GUILayout.Width(220)))
                 {
                     EnsureURPSetup();
                     Refresh();
@@ -257,11 +264,35 @@ namespace Genesis.RoomScan.Editor
             if (_cameraRig == null)
             {
                 EditorGUILayout.HelpBox(
-                    "Add a Camera Rig via  Meta > Tools > Building Blocks.\n" +
-                    "The wizard will add AROcclusionManager to it automatically.",
+                    "No XR Origin in the scene. Add one below (XR Origin > Camera Offset > Main Camera " +
+                    "with a TrackedPoseDriver and ARCameraManager); the Game-Ready preset also does this.\n" +
+                    "The wizard adds AROcclusionManager to its camera automatically.",
                     MessageType.Info);
+                GUILayout.Space(2);
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.FlexibleSpace();
+                if (GUILayout.Button("Add XR Origin Rig", GUILayout.Width(200)))
+                {
+                    EnsureXRRig();
+                    Refresh();
+                }
+                EditorGUILayout.EndHorizontal();
             }
-            else if (_arOcclusion == null)
+            else if (!_xrCameraConfigured)
+            {
+                GUILayout.Space(2);
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.FlexibleSpace();
+                if (GUILayout.Button("Configure XR Camera", GUILayout.Width(200)))
+                {
+                    ConfigureXRCameraForAndroidXR();
+                    MarkDirty();
+                    Refresh();
+                }
+                EditorGUILayout.EndHorizontal();
+            }
+
+            if (_cameraRig != null && _arOcclusion == null)
             {
                 GUILayout.Space(2);
                 EditorGUILayout.BeginHorizontal();
@@ -285,17 +316,28 @@ namespace Genesis.RoomScan.Editor
 
             if (go.GetComponent<ARSession>() == null)
                 Undo.AddComponent<ARSession>(go);
+            // Same pairing as the Android XR rig that has run on Galaxy XR.
+            if (go.GetComponent<ARInputManager>() == null)
+                Undo.AddComponent<ARInputManager>(go);
 
             MarkDirty();
             Refresh();
+        }
+
+        /// <summary>The XR Origin's camera, else the first camera under the rig.</summary>
+        static Camera FindXRCamera()
+        {
+            var origin = Object.FindAnyObjectByType<Unity.XR.CoreUtils.XROrigin>(FindObjectsInactive.Include);
+            if (origin == null) return null;
+            if (origin.Camera != null) return origin.Camera;
+            return origin.GetComponentInChildren<Camera>(true);
         }
 
         void FixAROcclusion()
         {
             if (_cameraRig == null) return;
 
-            // Find the camera — typically CenterEyeAnchor or Camera child
-            Camera cam = _cameraRig.GetComponentInChildren<Camera>();
+            Camera cam = FindXRCamera();
             if (cam == null)
             {
                 Debug.LogWarning("[RoomScan Setup] No Camera found under camera rig");
@@ -306,8 +348,8 @@ namespace Genesis.RoomScan.Editor
 
             // Need ARCameraManager as well for AROcclusionManager to work.
             // Both throw a wall of "No active XRSubsystem" errors in Editor
-            // play mode without an active XR loader (no Quest, no Quest
-            // Link). On device they're fine. We previously tried to silence
+            // play mode without an active XR loader (no headset attached).
+            // On device they're fine. We previously tried to silence
             // the Editor errors with EditorPlayModeXRGuard but the AR
             // OnEnable order bug it relied on never reliably fired before
             // the AR components' own OnEnable, and the workaround
@@ -329,9 +371,13 @@ namespace Genesis.RoomScan.Editor
         }
 
         /// <summary>
-        /// Leave AROcclusionManager and PassthroughCameraAccess disabled in
-        /// the scene. RoomScanner enables them for the scan window only.
-        /// USE_SCENE / HEADSET_CAMERA permission is still requested by the host.
+        /// Leave AROcclusionManager disabled in the scene: DepthCapture
+        /// enables it for the scan window, once
+        /// SCENE_UNDERSTANDING_FINE is granted (Android XR's occlusion
+        /// provider only warns when it starts without that permission).
+        /// ARCameraManager is the opposite on Android XR: enabling it is
+        /// what turns passthrough on (it delivers no camera images), so it
+        /// is kept enabled or the app renders over black outside a scan.
         /// </summary>
         void DisableIdleScanHardware()
         {
@@ -343,41 +389,134 @@ namespace Genesis.RoomScan.Editor
             }
             foreach (var cam in Object.FindObjectsByType<ARCameraManager>(FindObjectsInactive.Include))
             {
-                if (cam == null || !cam.enabled) continue;
-                cam.enabled = false;
+                if (cam == null || cam.enabled) continue;
+                cam.enabled = true;
                 EditorUtility.SetDirty(cam);
             }
         }
 
         /// <summary>
         /// Ensures the XR Origin's camera has an <see cref="ARCameraManager"/>,
-        /// which is where ARFoundation expects it. Added disabled so the
-        /// headset cameras are not opened until a scan starts.
+        /// which is where ARFoundation expects it. Added enabled: on Android
+        /// XR it is the passthrough switch (Android XR: AR Camera feature).
         /// </summary>
         static void EnsureARCameraManager()
         {
             if (Object.FindAnyObjectByType<ARCameraManager>(FindObjectsInactive.Include) != null)
                 return;
 
-            var origin = Object.FindAnyObjectByType<Unity.XR.CoreUtils.XROrigin>(FindObjectsInactive.Include);
-            var cam = origin != null ? origin.Camera : Camera.main;
+            var cam = FindXRCamera();
+            if (cam == null) cam = Camera.main;
             if (cam == null)
             {
                 Debug.LogWarning("[RoomScan Setup] No XR Origin camera found — " +
-                                 "cannot add ARCameraManager for passthrough frames.");
+                                 "cannot add ARCameraManager for passthrough.");
                 return;
             }
 
             var mgr = Undo.AddComponent<ARCameraManager>(cam.gameObject);
-            mgr.enabled = false;
+            mgr.enabled = true;
+        }
+
+        /// <summary>
+        /// True when the XR camera matches what Android XR needs: tagged
+        /// MainCamera (the occlusion provider reads Camera.main's clip
+        /// planes), SolidColor clear with alpha 0 (passthrough composites
+        /// under it), both eyes, an enabled ARCameraManager on it (the
+        /// passthrough switch), the XR Origin requesting Floor tracking, and
+        /// URP post-processing off on the camera.
+        /// </summary>
+        internal static bool IsXRCameraConfigured(out string problem)
+        {
+            problem = null;
+            var origin = Object.FindAnyObjectByType<Unity.XR.CoreUtils.XROrigin>(FindObjectsInactive.Include);
+            var cam = FindXRCamera();
+            if (origin == null || cam == null) { problem = "no XR Origin camera"; return false; }
+
+            var issues = new List<string>();
+            if (!cam.CompareTag("MainCamera")) issues.Add("tag != MainCamera");
+            var arCam = cam.GetComponent<ARCameraManager>();
+            if (arCam == null) issues.Add("no ARCameraManager (passthrough)");
+            else if (!arCam.enabled) issues.Add("ARCameraManager disabled (passthrough off)");
+            if (cam.clearFlags != CameraClearFlags.SolidColor) issues.Add($"clearFlags={cam.clearFlags}");
+            if (cam.backgroundColor.a > 0.001f) issues.Add($"clear alpha={cam.backgroundColor.a:0.##}");
+            if (cam.stereoTargetEye != StereoTargetEyeMask.Both) issues.Add($"stereoTargetEye={cam.stereoTargetEye}");
+            if (origin.RequestedTrackingOriginMode != Unity.XR.CoreUtils.XROrigin.TrackingOriginMode.Floor)
+                issues.Add($"trackingOrigin={origin.RequestedTrackingOriginMode}");
+            var urp = cam.GetComponent<UniversalAdditionalCameraData>();
+            if (urp != null && urp.renderPostProcessing) issues.Add("URP post-processing on");
+
+            if (issues.Count == 0) return true;
+            problem = string.Join(", ", issues);
+            return false;
+        }
+
+        /// <summary>
+        /// Applies <see cref="IsXRCameraConfigured"/>'s requirements to the
+        /// XR Origin's camera. Floor tracking is what this package's depth
+        /// and floor logic assume; if the headset rejects it, the fallback
+        /// is NotSpecified with CameraYOffset 0 (what the earlier Galaxy XR
+        /// project shipped).
+        /// </summary>
+        static void ConfigureXRCameraForAndroidXR()
+        {
+            var origin = Object.FindAnyObjectByType<Unity.XR.CoreUtils.XROrigin>(FindObjectsInactive.Include);
+            var cam = FindXRCamera();
+            if (origin == null || cam == null)
+            {
+                Debug.LogWarning("[RoomScan Setup] No XR Origin camera to configure.");
+                return;
+            }
+
+            if (origin.Camera == null)
+            {
+                Undo.RecordObject(origin, "Assign XR Origin camera");
+                origin.Camera = cam;
+            }
+
+            Undo.RecordObject(cam.gameObject, "Tag XR camera");
+            if (!cam.CompareTag("MainCamera")) cam.gameObject.tag = "MainCamera";
+
+            Undo.RecordObject(cam, "Configure XR camera for Android XR");
+            cam.clearFlags = CameraClearFlags.SolidColor;
+            var bg = cam.backgroundColor;
+            cam.backgroundColor = new Color(bg.r, bg.g, bg.b, 0f);
+            cam.stereoTargetEye = StereoTargetEyeMask.Both;
+            EditorUtility.SetDirty(cam);
+
+            // Passthrough on Android XR = an enabled ARCameraManager on the
+            // XR camera (Android XR: AR Camera feature).
+            var arCam = cam.GetComponent<ARCameraManager>();
+            if (arCam == null) arCam = Undo.AddComponent<ARCameraManager>(cam.gameObject);
+            if (!arCam.enabled)
+            {
+                Undo.RecordObject(arCam, "Enable ARCameraManager (passthrough)");
+                arCam.enabled = true;
+                EditorUtility.SetDirty(arCam);
+            }
+
+            if (origin.RequestedTrackingOriginMode != Unity.XR.CoreUtils.XROrigin.TrackingOriginMode.Floor)
+            {
+                Undo.RecordObject(origin, "XR Origin Floor tracking");
+                origin.RequestedTrackingOriginMode = Unity.XR.CoreUtils.XROrigin.TrackingOriginMode.Floor;
+                EditorUtility.SetDirty(origin);
+            }
+
+            var urp = cam.GetComponent<UniversalAdditionalCameraData>();
+            if (urp == null) urp = Undo.AddComponent<UniversalAdditionalCameraData>(cam.gameObject);
+            Undo.RecordObject(urp, "URP camera settings for Android XR");
+            urp.renderPostProcessing = false;
+            urp.allowXRRendering = true;
+            EditorUtility.SetDirty(urp);
         }
 
         /// <summary>
         /// Ensures the scene has an XR Origin rig with a tracked camera, plus
-        /// an <see cref="ARCameraManager"/> on it. This replaces the Meta XR
-        /// Building Blocks install: under OpenXR the rig is plain XR Origin,
-        /// and passthrough comes from the Meta OpenXR feature set rather than
-        /// an underlay component.
+        /// an <see cref="ARCameraManager"/> on it. Under OpenXR the rig is a
+        /// plain XR Origin, and on Android XR passthrough comes from the
+        /// Android XR: AR Camera feature via that ARCameraManager (an
+        /// ARCameraBackground does nothing there). The camera is then
+        /// brought in line with <see cref="ConfigureXRCameraForAndroidXR"/>.
         /// </summary>
         void EnsureXRRig()
         {
@@ -424,75 +563,83 @@ namespace Genesis.RoomScan.Editor
             }
 
             EnsureARCameraManager();
+            ConfigureXRCameraForAndroidXR();
             MarkDirty();
         }
 
         // -- Project Settings ---------------------------------------------
 
+        // Android manifest additions for Galaxy XR.
+        //
+        // The Android XR OpenXR build step (AndroidXRManifest, an
+        // IPostGenerateGradleAndroidProject in com.unity.xr.androidxr-openxr)
+        // already writes every XR entry into the generated
+        // unityLibrary/xrmanifest.androidlib, driven by the enabled features:
+        //   * SCENE_UNDERSTANDING_COARSE (AR Camera / Anchor / Occlusion)
+        //   * SCENE_UNDERSTANDING_FINE   (AR Occlusion: the scan's depth)
+        //   * HAND_TRACKING              (Hand Tracking Subsystem)
+        //   * EYE_TRACKING_*             (Foveated Rendering)
+        //   * android.software.xr.api.openxr, the controller / hand-tracking
+        //     uses-features, the OpenXR runtime-broker queries,
+        //     libopenxr.google.so and the full-space activity start mode.
+        // Declaring those again here would only duplicate them. What it does
+        // not add is android.permission.CAMERA (world-facing RGB camera via
+        // Camera2) and cleartext HTTP for the LAN Gaussian-splat server.
+        // Those two live in a small Android library module (same layout as
+        // the .androidlib that has shipped on Galaxy XR), so no custom main
+        // manifest is needed. A custom main manifest left over from a Quest
+        // setup is stripped of its Quest / Horizon entries.
         const string MANIFEST_PATH = "Assets/Plugins/Android/AndroidManifest.xml";
 
-        // Every <uses-feature> + <uses-permission> entry that QRS or its
-        // satellite modules expect at runtime. Some of these (HEADSET_CAMERA,
-        // USE_SCENE, USE_ANCHOR_API, etc.) are NOT in Meta's templated
-        // manifest set and get stripped any time OVRProjectSetup.FixAllAsync
-        // or the Project Setup Tool regenerates the manifest from
-        // OVRProjectConfig — hence this comprehensive ensure-pass that runs
-        // AFTER Meta's tooling in the wizard orchestrators.
-        //
-        // Each entry is idempotent (skip if already present, never remove).
-        struct ManifestFeature { public string Name; public bool Required; }
-        static readonly ManifestFeature[] REQUIRED_FEATURES = new[]
+        const string ANDROIDLIB_DIR      = "Assets/Plugins/Android/RoomScanAndroidXR.androidlib";
+        const string ANDROIDLIB_GRADLE   = ANDROIDLIB_DIR + "/build.gradle";
+        const string ANDROIDLIB_MANIFEST = ANDROIDLIB_DIR + "/src/main/AndroidManifest.xml";
+        const string ANDROIDLIB_NSC      = ANDROIDLIB_DIR + "/src/main/res/xml/network_security_config.xml";
+        const string ANDROIDLIB_NAMESPACE = "com.genesis.roomscan.androidxr";
+
+        // The previous (Quest) layout of the cleartext module.
+        const string LEGACY_NSC_ANDROIDLIB_DIR = "Assets/Plugins/Android/NetworkSecurityConfig.androidlib";
+
+        const string ANDROID_NS = "http://schemas.android.com/apk/res/android";
+
+        static readonly string[] REQUIRED_PERMISSIONS =
         {
-            new ManifestFeature { Name = "android.hardware.vr.headtracking", Required = true  },
-            new ManifestFeature { Name = "oculus.software.handtracking",     Required = false },
-            new ManifestFeature { Name = "com.oculus.feature.PASSTHROUGH",   Required = false },
-            new ManifestFeature { Name = "com.oculus.feature.BOUNDARYLESS_APP", Required = true },
+            "android.permission.CAMERA",
         };
 
-        static readonly string[] REQUIRED_PERMISSIONS = new[]
+        // Manifest entries that only mean something on Meta Horizon OS.
+        static readonly string[] QUEST_ENTRY_PREFIXES =
         {
-            "com.oculus.permission.HAND_TRACKING",
-            "com.oculus.permission.USE_ANCHOR_API",
-            "com.oculus.permission.USE_SCENE",
-            "horizonos.permission.HEADSET_CAMERA",
+            "com.oculus.", "oculus.", "horizonos.", "com.meta.",
         };
-
-        // horizonos SDK declaration — anchored to a current floor so MR
-        // features (camera, anchors) are exposed.
+        const string QUEST_HEADTRACKING_FEATURE = "android.hardware.vr.headtracking";
         const string HORIZONOS_NS = "http://schemas.horizonos/sdk";
-        const string HORIZONOS_MIN_SDK_VERSION = "60";
-        const string HORIZONOS_TARGET_SDK_VERSION = "85";
 
         void DrawProjectSettings()
         {
             BeginSection("PROJECT SETTINGS");
 
-            StatusRow("AndroidManifest Quest VR entries (features + permissions)",
-                      _boundarylessManifest);
-            StatusRow("AndroidManifest cleartext HTTP (LAN)", _cleartextAllowed);
+            EditorGUILayout.HelpBox(
+                "Scene-understanding, hand-tracking and OpenXR manifest entries are generated by the " +
+                "Android XR build step from the enabled OpenXR features. This adds only what it does " +
+                "not: android.permission.CAMERA and cleartext HTTP (LAN splat server), in " +
+                ANDROIDLIB_DIR + ".",
+                MessageType.Info);
+
+            StatusRow("Android XR manifest additions (CAMERA permission)", _androidXRManifest);
+            StatusRow("Cleartext HTTP for the LAN splat server", _cleartextAllowed);
             StatusRow("Player Settings: Allow HTTP", _insecureHttpAllowed);
+            if (_questManifestLeftovers)
+                StatusRow("Custom AndroidManifest.xml free of Quest / Horizon entries", false);
 
-            if (!_boundarylessManifest)
+            if (!_androidXRManifest || !_cleartextAllowed || _questManifestLeftovers)
             {
                 GUILayout.Space(2);
                 EditorGUILayout.BeginHorizontal();
                 GUILayout.FlexibleSpace();
-                if (GUILayout.Button("Add Quest VR Manifest Entries", GUILayout.Width(220)))
+                if (GUILayout.Button("Apply Android XR Manifest Entries", GUILayout.Width(240)))
                 {
-                    EnsureQuestVRManifest();
-                    Refresh();
-                }
-                EditorGUILayout.EndHorizontal();
-            }
-
-            if (!_cleartextAllowed)
-            {
-                GUILayout.Space(2);
-                EditorGUILayout.BeginHorizontal();
-                GUILayout.FlexibleSpace();
-                if (GUILayout.Button("Allow Cleartext HTTP", GUILayout.Width(200)))
-                {
-                    FixCleartextTraffic();
+                    EnsureAndroidXRManifest();
                     Refresh();
                 }
                 EditorGUILayout.EndHorizontal();
@@ -515,230 +662,175 @@ namespace Genesis.RoomScan.Editor
             EndSection();
         }
 
-        /// <summary>
-        /// Returns true iff every entry in REQUIRED_FEATURES /
-        /// REQUIRED_PERMISSIONS plus the horizonos SDK declaration is
-        /// already present in the manifest. Used by the status row + by the
-        /// orchestrators to decide whether to re-run the ensure-pass.
-        /// </summary>
-        static bool ManifestHasAllQuestVREntries()
+        static string ProjectPath(string assetRelative) =>
+            Path.Combine(Application.dataPath, "..", assetRelative);
+
+        static XDocument TryLoadXml(string assetRelative)
         {
-            string fullPath = Path.Combine(Application.dataPath, "..", MANIFEST_PATH);
-            if (!File.Exists(fullPath)) return false;
-
-            try
-            {
-                var doc = XDocument.Load(fullPath);
-                if (doc.Root == null) return false;
-                XNamespace android = "http://schemas.android.com/apk/res/android";
-                XNamespace horizonos = HORIZONOS_NS;
-
-                foreach (var f in REQUIRED_FEATURES)
-                {
-                    bool found = doc.Root.Elements("uses-feature")
-                        .Any(e => e.Attribute(android + "name")?.Value == f.Name);
-                    if (!found) return false;
-                }
-
-                foreach (var p in REQUIRED_PERMISSIONS)
-                {
-                    bool found = doc.Root.Elements("uses-permission")
-                        .Any(e => e.Attribute(android + "name")?.Value == p);
-                    if (!found) return false;
-                }
-
-                bool hasHorizonOsSdk = doc.Root.Elements(horizonos + "uses-horizonos-sdk").Any();
-                if (!hasHorizonOsSdk) return false;
-
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
+            string full = ProjectPath(assetRelative);
+            if (!File.Exists(full)) return null;
+            try { return XDocument.Load(full); }
+            catch { return null; }
         }
 
         /// <summary>
-        /// Idempotent: adds every required uses-feature, uses-permission, and
-        /// the horizonos:uses-horizonos-sdk declaration if any are missing.
-        /// Never removes existing entries — safe to run after Meta's
-        /// OVRProjectSetup.FixAllAsync has rewritten the manifest from
-        /// OVRProjectConfig defaults (which strips MR-only permissions like
-        /// HEADSET_CAMERA / USE_SCENE that aren't in OVR's template).
+        /// True iff the library module exists (build.gradle + manifest) and
+        /// its manifest declares every entry in REQUIRED_PERMISSIONS.
         /// </summary>
-        static void EnsureQuestVRManifest()
+        static bool AndroidXRManifestLibHasPermissions()
         {
-            string fullPath = Path.Combine(Application.dataPath, "..", MANIFEST_PATH);
+            if (!File.Exists(ProjectPath(ANDROIDLIB_GRADLE))) return false;
+            var doc = TryLoadXml(ANDROIDLIB_MANIFEST);
+            if (doc?.Root == null) return false;
+            XNamespace android = ANDROID_NS;
+            return REQUIRED_PERMISSIONS.All(p => doc.Root.Elements("uses-permission")
+                .Any(e => e.Attribute(android + "name")?.Value == p));
+        }
 
-            if (!File.Exists(fullPath))
+        static bool AndroidXRManifestLibHasCleartext()
+        {
+            if (!File.Exists(ProjectPath(ANDROIDLIB_NSC))) return false;
+            var doc = TryLoadXml(ANDROIDLIB_MANIFEST);
+            var app = doc?.Root?.Element("application");
+            if (app == null) return false;
+            XNamespace android = ANDROID_NS;
+            return app.Attribute(android + "usesCleartextTraffic")?.Value == "true"
+                && app.Attribute(android + "networkSecurityConfig")?.Value == "@xml/network_security_config";
+        }
+
+        static bool IsQuestManifestName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            if (name == QUEST_HEADTRACKING_FEATURE) return true;
+            foreach (var prefix in QUEST_ENTRY_PREFIXES)
+                if (name.StartsWith(prefix, System.StringComparison.Ordinal)) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Every element in a custom main manifest that only exists for Meta
+        /// Horizon OS: com.oculus.* / horizonos.* permissions, features,
+        /// meta-data and intent categories, the VR head-tracking feature, and
+        /// horizonos:* elements.
+        /// </summary>
+        static List<XElement> QuestManifestElements(XDocument doc)
+        {
+            var found = new List<XElement>();
+            if (doc?.Root == null) return found;
+            XNamespace android = ANDROID_NS;
+            XNamespace horizonos = HORIZONOS_NS;
+            foreach (var e in doc.Root.Descendants())
             {
-                EditorUtility.DisplayDialog("Room Scan Setup",
-                    "AndroidManifest.xml not found at:\n" + MANIFEST_PATH + "\n\n" +
-                    "Build the project once or create a custom manifest first.",
-                    "OK");
-                return;
+                if (e.Name.Namespace == horizonos) { found.Add(e); continue; }
+                string local = e.Name.LocalName;
+                if (local != "uses-permission" && local != "uses-feature" && local != "meta-data"
+                    && local != "category" && local != "uses-permission-sdk-23")
+                    continue;
+                if (IsQuestManifestName(e.Attribute(android + "name")?.Value))
+                    found.Add(e);
             }
+            return found;
+        }
+
+        static bool MainManifestHasQuestEntries()
+        {
+            var doc = TryLoadXml(MANIFEST_PATH);
+            if (doc?.Root == null) return false;
+            return QuestManifestElements(doc).Count > 0
+                || doc.Root.Attribute(XNamespace.Xmlns + "horizonos") != null;
+        }
+
+        /// <summary>
+        /// Removes Quest / Horizon-only entries from a custom main manifest,
+        /// if the project has one. Never touches anything else in it.
+        /// Returns the number of entries removed.
+        /// </summary>
+        static int StripQuestEntriesFromMainManifest()
+        {
+            string fullPath = ProjectPath(MANIFEST_PATH);
+            var doc = TryLoadXml(MANIFEST_PATH);
+            if (doc?.Root == null) return 0;
 
             try
             {
-                var doc = XDocument.Load(fullPath);
-                if (doc.Root == null)
+                XNamespace android = ANDROID_NS;
+                var removed = new List<string>();
+                foreach (var e in QuestManifestElements(doc))
                 {
-                    Debug.LogError("[RoomScan Setup] AndroidManifest.xml has no <manifest> root.");
-                    return;
+                    removed.Add($"{e.Name.LocalName}:{e.Attribute(android + "name")?.Value ?? e.Name.ToString()}");
+                    e.Remove();
                 }
-
-                XNamespace android = "http://schemas.android.com/apk/res/android";
-                XNamespace horizonos = HORIZONOS_NS;
-                bool dirty = false;
-                var added = new List<string>();
-
-                // Make sure xmlns:horizonos is declared on root so the SDK
-                // element below can use the prefix without serializing as
-                // xmlns="...". Unity templates usually include it but
-                // OVR-regenerated manifests may not.
-                if (doc.Root.Attribute(XNamespace.Xmlns + "horizonos") == null)
+                var nsAttr = doc.Root.Attribute(XNamespace.Xmlns + "horizonos");
+                if (nsAttr != null)
                 {
-                    doc.Root.Add(new XAttribute(XNamespace.Xmlns + "horizonos", HORIZONOS_NS));
-                    dirty = true;
+                    nsAttr.Remove();
+                    removed.Add("xmlns:horizonos");
                 }
-
-                // <uses-feature>
-                foreach (var f in REQUIRED_FEATURES)
-                {
-                    bool exists = doc.Root.Elements("uses-feature")
-                        .Any(e => e.Attribute(android + "name")?.Value == f.Name);
-                    if (exists) continue;
-
-                    var el = new XElement("uses-feature",
-                        new XAttribute(android + "name", f.Name),
-                        new XAttribute(android + "required", f.Required ? "true" : "false"));
-
-                    // headtracking gets a version attr by Android convention.
-                    if (f.Name == "android.hardware.vr.headtracking")
-                        el.Add(new XAttribute(android + "version", "1"));
-
-                    doc.Root.Add(el);
-                    added.Add($"feature:{f.Name}");
-                    dirty = true;
-                }
-
-                // <uses-permission>
-                foreach (var p in REQUIRED_PERMISSIONS)
-                {
-                    bool exists = doc.Root.Elements("uses-permission")
-                        .Any(e => e.Attribute(android + "name")?.Value == p);
-                    if (exists) continue;
-
-                    doc.Root.Add(new XElement("uses-permission",
-                        new XAttribute(android + "name", p)));
-                    added.Add($"perm:{p}");
-                    dirty = true;
-                }
-
-                // <horizonos:uses-horizonos-sdk>
-                bool hasHorizonOsSdk = doc.Root.Elements(horizonos + "uses-horizonos-sdk").Any();
-                if (!hasHorizonOsSdk)
-                {
-                    doc.Root.Add(new XElement(horizonos + "uses-horizonos-sdk",
-                        new XAttribute(horizonos + "minSdkVersion",    HORIZONOS_MIN_SDK_VERSION),
-                        new XAttribute(horizonos + "targetSdkVersion", HORIZONOS_TARGET_SDK_VERSION)));
-                    added.Add("horizonos:uses-horizonos-sdk");
-                    dirty = true;
-                }
-
-                if (!dirty)
-                {
-                    return;
-                }
+                if (removed.Count == 0) return 0;
 
                 doc.Save(fullPath);
-                AssetDatabase.Refresh();
-                Debug.Log($"[RoomScan Setup] AndroidManifest: added {added.Count} entr{(added.Count == 1 ? "y" : "ies")} \u2192 " +
-                          string.Join(", ", added));
+                AssetDatabase.ImportAsset(MANIFEST_PATH);
+                Debug.Log($"[RoomScan Setup] {MANIFEST_PATH}: removed {removed.Count} Quest / Horizon entr" +
+                          $"{(removed.Count == 1 ? "y" : "ies")} → " + string.Join(", ", removed));
+                return removed.Count;
             }
             catch (System.Exception ex)
             {
-                Debug.LogError($"[RoomScan Setup] Failed to update manifest: {ex.Message}\n{ex.StackTrace}");
+                Debug.LogError($"[RoomScan Setup] Failed to strip Quest entries from {MANIFEST_PATH}: {ex.Message}");
+                return 0;
             }
         }
 
-        // -- Cleartext HTTP -----------------------------------------------
-
-        const string ANDROIDLIB_DIR = "Assets/Plugins/Android/NetworkSecurityConfig.androidlib";
-        const string ANDROIDLIB_NSC = ANDROIDLIB_DIR + "/res/xml/network_security_config.xml";
-
-        static bool ManifestHasCleartextTraffic()
+        /// <summary>
+        /// Idempotent: creates / updates the RoomScanAndroidXR.androidlib
+        /// module (CAMERA permission + cleartext HTTP via a network security
+        /// config), and strips Quest / Horizon entries from a custom main
+        /// manifest. Existing entries in the module manifest are kept.
+        /// </summary>
+        static void EnsureAndroidXRManifest()
         {
-            string fullPath = Path.Combine(Application.dataPath, "..", MANIFEST_PATH);
-            if (!File.Exists(fullPath)) return false;
-
             try
             {
-                var doc = XDocument.Load(fullPath);
-                XNamespace android = "http://schemas.android.com/apk/res/android";
-                var app = doc.Root?.Element("application");
-                if (app == null) return false;
+                var written = new List<string>();
 
-                string val = app.Attribute(android + "usesCleartextTraffic")?.Value;
-                if (val != "true") return false;
+                // build.gradle — mirrors the library module layout that has
+                // built with Unity 6000.4 for Galaxy XR (AGP namespace, SDK
+                // levels taken from Unity's gradle properties).
+                string gradleFull = ProjectPath(ANDROIDLIB_GRADLE);
+                if (!File.Exists(gradleFull))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(gradleFull));
+                    File.WriteAllText(gradleFull,
+                        "apply plugin: 'com.android.library'\n" +
+                        "\n" +
+                        "dependencies {\n" +
+                        "    implementation fileTree(dir: 'libs', include: ['*.jar'])\n" +
+                        "}\n" +
+                        "\n" +
+                        "android {\n" +
+                        "    namespace \"" + ANDROIDLIB_NAMESPACE + "\"\n" +
+                        "    compileSdk getProperty(\"unity.compileSdkVersion\") as int\n" +
+                        "    buildToolsVersion = getProperty(\"unity.buildToolsVersion\")\n" +
+                        "\n" +
+                        "    compileOptions {\n" +
+                        "        sourceCompatibility JavaVersion.valueOf(getProperty(\"unity.javaCompatabilityVersion\"))\n" +
+                        "        targetCompatibility JavaVersion.valueOf(getProperty(\"unity.javaCompatabilityVersion\"))\n" +
+                        "    }\n" +
+                        "\n" +
+                        "    defaultConfig {\n" +
+                        "        minSdk getProperty(\"unity.minSdkVersion\") as int\n" +
+                        "        targetSdk getProperty(\"unity.targetSdkVersion\") as int\n" +
+                        "    }\n" +
+                        "}\n");
+                    written.Add("build.gradle");
+                }
 
-                string nscFull = Path.Combine(Application.dataPath, "..", ANDROIDLIB_NSC);
-                return File.Exists(nscFull);
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        static void FixCleartextTraffic()
-        {
-            string manifestFull = Path.Combine(Application.dataPath, "..", MANIFEST_PATH);
-
-            if (!File.Exists(manifestFull))
-            {
-                EditorUtility.DisplayDialog("Room Scan Setup",
-                    "AndroidManifest.xml not found at:\n" + MANIFEST_PATH + "\n\n" +
-                    "Build the project once or create a custom manifest first.",
-                    "OK");
-                return;
-            }
-
-            try
-            {
-                var doc = XDocument.Load(manifestFull);
-                XNamespace android = "http://schemas.android.com/apk/res/android";
-                var app = doc.Root?.Element("application");
-                if (app == null) return;
-
-                // android:usesCleartextTraffic="true"
-                var cleartext = app.Attribute(android + "usesCleartextTraffic");
-                if (cleartext == null)
-                    app.Add(new XAttribute(android + "usesCleartextTraffic", "true"));
-                else
-                    cleartext.Value = "true";
-
-                // android:networkSecurityConfig="@xml/network_security_config"
-                var nscAttr = app.Attribute(android + "networkSecurityConfig");
-                if (nscAttr == null)
-                    app.Add(new XAttribute(android + "networkSecurityConfig", "@xml/network_security_config"));
-                else
-                    nscAttr.Value = "@xml/network_security_config";
-
-                doc.Save(manifestFull);
-                Debug.Log("[RoomScan Setup] Added cleartext HTTP attributes to AndroidManifest.xml");
-
-                // Unity 6+ requires Android resources in an .androidlib, not raw res/
-                string libRoot = Path.Combine(Application.dataPath, "..", ANDROIDLIB_DIR);
-                string nscDir = Path.Combine(libRoot, "res", "xml");
-                if (!Directory.Exists(nscDir))
-                    Directory.CreateDirectory(nscDir);
-
-                string nscFull = Path.Combine(nscDir, "network_security_config.xml");
+                // Network security config: cleartext to any host, system CAs.
+                string nscFull = ProjectPath(ANDROIDLIB_NSC);
                 if (!File.Exists(nscFull))
                 {
-                    const string nscContent =
+                    Directory.CreateDirectory(Path.GetDirectoryName(nscFull));
+                    File.WriteAllText(nscFull,
                         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
                         "<network-security-config>\n" +
                         "    <base-config cleartextTrafficPermitted=\"true\">\n" +
@@ -746,33 +838,88 @@ namespace Genesis.RoomScan.Editor
                         "            <certificates src=\"system\" />\n" +
                         "        </trust-anchors>\n" +
                         "    </base-config>\n" +
-                        "</network-security-config>\n";
-                    File.WriteAllText(nscFull, nscContent);
+                        "</network-security-config>\n");
+                    written.Add("network_security_config.xml");
                 }
 
-                // AndroidManifest.xml for the library module
-                string libManifest = Path.Combine(libRoot, "AndroidManifest.xml");
-                if (!File.Exists(libManifest))
+                // Library manifest (merged into the app manifest by Gradle).
+                string manifestFull = ProjectPath(ANDROIDLIB_MANIFEST);
+                XNamespace android = ANDROID_NS;
+                XDocument doc = TryLoadXml(ANDROIDLIB_MANIFEST);
+                bool dirty = false;
+                if (doc?.Root == null)
                 {
-                    const string libManifestContent =
-                        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
-                        "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n" +
-                        "    package=\"com.genesis.roomscan.netsecconfig\">\n" +
-                        "</manifest>\n";
-                    File.WriteAllText(libManifest, libManifestContent);
+                    doc = new XDocument(new XDeclaration("1.0", "utf-8", null),
+                        new XComment(" Generated by the Room Scan setup wizard (Galaxy XR / Android XR). " +
+                                     "Scene-understanding and hand-tracking permissions come from the " +
+                                     "Android XR build step, not from here. "),
+                        new XElement("manifest", new XAttribute(XNamespace.Xmlns + "android", ANDROID_NS)));
+                    dirty = true;
                 }
 
-                // project.properties marks it as a library
-                string projProps = Path.Combine(libRoot, "project.properties");
-                if (!File.Exists(projProps))
-                    File.WriteAllText(projProps, "android.library=true\n");
+                foreach (var p in REQUIRED_PERMISSIONS)
+                {
+                    bool exists = doc.Root.Elements("uses-permission")
+                        .Any(e => e.Attribute(android + "name")?.Value == p);
+                    if (exists) continue;
+                    doc.Root.Add(new XElement("uses-permission", new XAttribute(android + "name", p)));
+                    written.Add($"perm:{p}");
+                    dirty = true;
+                }
 
-                Debug.Log($"[RoomScan Setup] Created {ANDROIDLIB_DIR} with network_security_config.xml");
-                AssetDatabase.Refresh();
+                // CAMERA implies a required camera for store filtering;
+                // declare it optional (sideloaded builds ignore this).
+                const string cameraFeature = "android.hardware.camera";
+                if (!doc.Root.Elements("uses-feature").Any(e => e.Attribute(android + "name")?.Value == cameraFeature))
+                {
+                    doc.Root.Add(new XElement("uses-feature",
+                        new XAttribute(android + "name", cameraFeature),
+                        new XAttribute(android + "required", "false")));
+                    written.Add($"feature:{cameraFeature}");
+                    dirty = true;
+                }
+
+                var app = doc.Root.Element("application");
+                if (app == null)
+                {
+                    app = new XElement("application");
+                    doc.Root.Add(app);
+                    dirty = true;
+                }
+                if (app.Attribute(android + "usesCleartextTraffic")?.Value != "true")
+                {
+                    app.SetAttributeValue(android + "usesCleartextTraffic", "true");
+                    written.Add("usesCleartextTraffic");
+                    dirty = true;
+                }
+                if (app.Attribute(android + "networkSecurityConfig")?.Value != "@xml/network_security_config")
+                {
+                    app.SetAttributeValue(android + "networkSecurityConfig", "@xml/network_security_config");
+                    written.Add("networkSecurityConfig");
+                    dirty = true;
+                }
+
+                if (dirty)
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(manifestFull));
+                    doc.Save(manifestFull);
+                }
+
+                if (written.Count > 0)
+                {
+                    AssetDatabase.Refresh();
+                    Debug.Log($"[RoomScan Setup] {ANDROIDLIB_DIR}: wrote " + string.Join(", ", written));
+                }
+
+                if (AssetDatabase.IsValidFolder(LEGACY_NSC_ANDROIDLIB_DIR))
+                    Debug.LogWarning($"[RoomScan Setup] {LEGACY_NSC_ANDROIDLIB_DIR} is the old cleartext module; " +
+                                     $"{ANDROIDLIB_DIR} replaces it. Delete the old one if nothing else uses it.");
+
+                StripQuestEntriesFromMainManifest();
             }
             catch (System.Exception ex)
             {
-                Debug.LogError($"[RoomScan Setup] Failed to enable cleartext traffic: {ex.Message}");
+                Debug.LogError($"[RoomScan Setup] Failed to update Android manifest additions: {ex.Message}\n{ex.StackTrace}");
             }
         }
 
@@ -818,7 +965,7 @@ namespace Genesis.RoomScan.Editor
             DrawGSplatOptionalStatus();
             DrawAIDetectionOptionalStatus();
             StatusRowOptional("TextureRefinement", _roomScanner != null && _roomScanner.GetComponent<TextureRefinement>() != null);
-            StatusRowOptional("RoomUnderstanding (MRUK bridge)", _roomScanner != null && _roomScanner.GetComponent<RoomUnderstanding>() != null);
+            StatusRowOptional("RoomUnderstanding (scene-understanding stub)", _roomScanner != null && _roomScanner.GetComponent<RoomUnderstanding>() != null);
             StatusRowOptional("CameraDebugOverlay", _cameraDebug != null);
             StatusRowOptional("DepthDebugOverlay", _depthDebug != null);
             StatusRowOptional("RoomScanInputHandler", _inputHandler != null);
@@ -1009,13 +1156,13 @@ namespace Genesis.RoomScan.Editor
         {
             BeginSection("GAME-READY PRESET");
             EditorGUILayout.HelpBox(
-                "One-click \"make this project actually buildable for Quest VR\":\n" +
-                "  \u2022 Switch active build profile to Meta Quest if needed (re-click after the reload)\n" +
-                "  \u2022 URP pipeline + renderer at Assets/Settings/ with Quest-friendly defaults (4x MSAA, no HDR, single shadow cascade)\n" +
-                "  \u2022 VR project prerequisites (XR Plug-in, OpenXR features \u2014 Outstanding tier)\n" +
-                "  \u2022 AndroidManifest: full Quest VR feature/permission set (HEADSET_CAMERA, USE_SCENE, USE_ANCHOR_API, BOUNDARYLESS, etc.) + cleartext HTTP + insecureHttpOption\n" +
-                "  \u2022 XR Origin rig, passthrough, and ARCameraManager\n" +
-                "  \u2022 AR Session + AROcclusionManager on the camera rig\n" +
+                "One-click \"make this project actually buildable for Samsung Galaxy XR\":\n" +
+                "  \u2022 Switch to the plain Android platform if needed (re-click after the reload)\n" +
+                "  \u2022 URP pipeline + renderer at Assets/Settings/ with Android XR defaults (HDR off, post-processing off, 4x MSAA, single shadow cascade)\n" +
+                "  \u2022 Android XR project prerequisites (OpenXR loader, Android XR features, IL2CPP / ARM64 / Vulkan, Run In Background \u2014 Outstanding tier)\n" +
+                "  \u2022 Android manifest additions: CAMERA + cleartext HTTP + insecureHttpOption (scene / hand permissions come from the Android XR build step)\n" +
+                "  \u2022 XR Origin rig (Floor), transparent MainCamera, ARCameraManager (passthrough)\n" +
+                "  \u2022 AR Session + AROcclusionManager on the XR camera\n" +
                 "  \u2022 Game-ready scene modules (scan \u2192 refine \u2192 release GPU \u2192 play)\n" +
                 "  \u2022 Shader wiring + xatlas native plugin build (background)\n" +
                 "Skips TriplanarCache, Gaussian Splat, and debug tools to keep the build lean.",
@@ -1030,7 +1177,7 @@ namespace Genesis.RoomScan.Editor
             StatusRowOptional("ARCameraManager (camera RGB)", hasCameraManager);
             StatusRowOptional("PassthroughCameraProvider", hasPCAProvider);
             StatusRowOptional("TextureRefinement (atlas baking)", hasRefinement);
-            StatusRowOptional("RoomUnderstanding (MRUK bridge)", hasRoomUnderstanding);
+            StatusRowOptional("RoomUnderstanding (scene-understanding stub)", hasRoomUnderstanding);
             StatusRowOptional("RoomScanSession (game-dev async API: StartScanAsync / UnloadActiveScanAsync / FinalizeScanAsync / LoadAsync)",
                               _session != null);
 
@@ -1050,17 +1197,15 @@ namespace Genesis.RoomScan.Editor
             GUILayout.Space(2);
             EditorGUILayout.LabelField("Project prerequisites", EditorStyles.miniLabel);
             bool buildTargetIsAndroid = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android;
-            bool activeProfileIsMetaQuest = IsActiveProfileMetaQuest();
-            string profileLabel = activeProfileIsMetaQuest
-                ? "Meta Quest"
-                : (buildTargetIsAndroid ? "Android (plain)" : EditorUserBuildSettings.activeBuildTarget.ToString());
-            StatusRowOptional($"Active build profile = Meta Quest (current: {profileLabel})", activeProfileIsMetaQuest);
-            StatusRowOptional("URP pipeline asset (Quest defaults)", _urpConfigured);
+            bool platformIsPlainAndroid = IsActivePlatformPlainAndroid();
+            StatusRowOptional($"Active platform = plain Android (current: {DescribeActivePlatform()})", platformIsPlainAndroid);
+            StatusRowOptional("URP pipeline asset (Android XR: HDR off, post-processing off)", _urpConfigured);
             StatusRowOptional("AR Session + AROcclusionManager", _arSession != null && _arOcclusion != null);
-            StatusRowOptional("AndroidManifest (Quest VR features + permissions + cleartext)",
-                              _boundarylessManifest && _cleartextAllowed);
+            StatusRowOptional("XR camera (MainCamera, transparent clear, passthrough on, Floor)", _xrCameraConfigured);
+            StatusRowOptional("Android manifest additions (CAMERA + cleartext, no Quest entries)",
+                              _androidXRManifest && _cleartextAllowed && !_questManifestLeftovers);
             StatusRowOptional("Player Settings: Allow HTTP", _insecureHttpAllowed);
-            StatusRowOptional($"VR Project Bootstrap ({_vrOutstanding.Count} outstanding)", _vrOutstanding.Count == 0);
+            StatusRowOptional($"Android XR project checks ({_vrOutstanding.Count} outstanding)", _vrOutstanding.Count == 0);
             StatusRowOptional("xatlas native plugins (Android + Editor)", _xatlasAndroid && _xatlasEditor);
 
             bool triplanarAttached = _triplanarCache != null;
@@ -1083,10 +1228,12 @@ namespace Genesis.RoomScan.Editor
             bool sceneMissing   = !hasCameraManager || !hasPCAProvider || !hasRefinement || !hasRoomUnderstanding
                                   || _session == null;
             bool projectMissing = !buildTargetIsAndroid
-                                  || !activeProfileIsMetaQuest
+                                  || !platformIsPlainAndroid
                                   || !_urpConfigured
                                   || _arSession == null || _arOcclusion == null
-                                  || !_boundarylessManifest || !_cleartextAllowed || !_insecureHttpAllowed
+                                  || !_xrCameraConfigured
+                                  || !_androidXRManifest || !_cleartextAllowed || _questManifestLeftovers
+                                  || !_insecureHttpAllowed
                                   || _vrOutstanding.Count > 0
                                   || !_xatlasAndroid || !_xatlasEditor;
 
@@ -1103,7 +1250,7 @@ namespace Genesis.RoomScan.Editor
                 EditorGUILayout.EndHorizontal();
 
                 if (_gameReadyFixInProgress)
-                    EditorGUILayout.HelpBox("Game-Ready setup in progress (VR bootstrap + Meta XR sweep)\u2026", MessageType.Info);
+                    EditorGUILayout.HelpBox("Game-Ready setup in progress (Android XR project checks + scene)\u2026", MessageType.Info);
             }
 
             EndSection();
@@ -1154,8 +1301,7 @@ namespace Genesis.RoomScan.Editor
 
         // Tracks whether either the Game-Ready preset or Setup Everything is
         // currently running, so the matching buttons can disable themselves and
-        // we never re-enter the async orchestrator while VRProjectBootstrap.FixAllAsync
-        // is still awaiting Meta's project setup tool.
+        // we never re-enter the async orchestrator while it is mid-run.
         bool _gameReadyFixInProgress;
 
         async void FixGameReadyModules()
@@ -1176,23 +1322,18 @@ namespace Genesis.RoomScan.Editor
                 // so any later step that touches a Material/Shader needs
                 // this in place.
                 EditorUtility.DisplayProgressBar("Game-Ready Setup",
-                    "Ensuring URP pipeline + Quest-friendly defaults\u2026", 0.10f);
+                    "Ensuring URP pipeline + Android XR defaults\u2026", 0.10f);
                 EnsureURPSetup();
 
                 EditorUtility.DisplayProgressBar("Game-Ready Setup",
-                    "Fixing VR prerequisites (XR Plug-in, OpenXR features\u2026)", 0.15f);
+                    "Fixing Android XR prerequisites (XR Plug-in, OpenXR features\u2026)", 0.15f);
                 await VRProjectBootstrap.FixAllAsync(CheckSeverity.Outstanding);
 
-                // EnsureQuestVRManifest is unconditional (and idempotent) on
-                // purpose — it has to undo any permission stripping that
-                // OVRProjectSetup.FixAllAsync may have done a moment ago when
-                // it regenerated the manifest from OVRProjectConfig defaults.
-                // HEADSET_CAMERA / USE_SCENE / USE_ANCHOR_API are not in
-                // Meta's templated set and would otherwise vanish here.
+                // Idempotent: CAMERA + cleartext module, Quest entries
+                // stripped from any custom main manifest.
                 EditorUtility.DisplayProgressBar("Game-Ready Setup",
-                    "Updating AndroidManifest + Player Settings\u2026", 0.50f);
-                EnsureQuestVRManifest();
-                if (!ManifestHasCleartextTraffic()) FixCleartextTraffic();
+                    "Updating Android manifest additions + Player Settings\u2026", 0.50f);
+                EnsureAndroidXRManifest();
                 if (PlayerSettings.insecureHttpOption == InsecureHttpOption.NotAllowed)
                 {
                     PlayerSettings.insecureHttpOption = InsecureHttpOption.AlwaysAllowed;
@@ -1254,13 +1395,11 @@ namespace Genesis.RoomScan.Editor
             if (root.GetComponent<RoomScanner>() == null)
                 Undo.AddComponent<RoomScanner>(root);
 
-            // PassthroughCameraAccess is normally added by the Meta XR
-            // Building Block (see EnsureRequiredBuildingBlocksAsync), but
-            // fall back to a root-level component if the block didn't land
-            // anywhere in the scene — RoomScanner needs a PCA somewhere.
-            // PCA + ARSession + AROcclusionManager will spam errors in
-            // Editor play mode without an XR loader; that's expected,
-            // build to device.
+            // ARCameraManager sits on the XR camera (passthrough on
+            // Android XR); PassthroughCameraProvider on the root is the
+            // scanner's camera provider. Both, plus ARSession +
+            // AROcclusionManager, spam errors in Editor play mode without
+            // an XR loader; that's expected, build to device.
             EnsureARCameraManager();
             if (root.GetComponent<PassthroughCameraProvider>() == null)
                 Undo.AddComponent<PassthroughCameraProvider>(root);
@@ -1335,44 +1474,39 @@ namespace Genesis.RoomScan.Editor
         }
 
         /// <summary>
-        /// If the active build target is not Android, switches it (which
-        /// triggers a domain reload and aborts the current async pipeline)
-        /// and returns true so the caller bails out cleanly. The user is
-        /// informed via dialog that they need to re-click after the reload.
+        /// If the active platform is not plain Android (a different target,
+        /// a derived Android platform such as Android XR, or a custom build
+        /// profile), switches to plain Android, which triggers a domain
+        /// reload and aborts the current async pipeline, and returns true so
+        /// the caller bails out cleanly. The user is told via dialog to
+        /// re-click after the reload. Returns false (carry on) when already
+        /// on plain Android, or when no switch could be issued; the platform
+        /// row then stays red with instructions in the console.
         /// </summary>
         bool TrySwitchToAndroidBuildTarget(string flowName)
         {
-            // Already on the Meta Quest profile? Nothing to do.
-            if (EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android
-                && IsActiveProfileMetaQuest())
+            if (IsActivePlatformPlainAndroid())
                 return false;
 
             EditorUtility.ClearProgressBar();
 
-            // Try the Meta Quest *build profile* first (Unity 6.1+). It's a
-            // derived Android profile that ships Quest-tuned Player + Quality
-            // overrides (Vulkan, IL2CPP, ARM64, Multiview, Quest quality
-            // level), and it's what the user picks by hand in File > Build
-            // Profiles. Falls back to plain Android if Meta Quest isn't
-            // registered (older Unity, missing Android module, etc.).
-            string what = "Meta Quest build profile";
+            // Galaxy XR builds use the plain Android platform with the OpenXR
+            // Android XR features (RoomScanSetupWizard.BuildProfile.cs says
+            // why the derived platforms are avoided).
             EditorUtility.DisplayDialog(flowName,
-                "Active build target is " + EditorUserBuildSettings.activeBuildTarget +
-                (IsActiveProfileMetaQuest() ? " (Meta Quest profile)" : "") + ".\n\n" +
-                "Switching to the " + what + " now \u2014 this triggers a domain reload " +
-                "and aborts the rest of this run.\n\n" +
+                "Active platform is " + DescribeActivePlatform() + ".\n\n" +
+                "Switching to the plain Android platform (Samsung Galaxy XR) now — this " +
+                "triggers a domain reload and aborts the rest of this run.\n\n" +
                 "Click \"" + flowName + "\" again after Unity finishes reloading to " +
                 "apply the remaining fixes.",
                 "Switch and reload");
 
-            if (!TryActivateMetaQuestProfile())
+            if (!TryActivatePlainAndroidPlatform())
             {
-                Debug.LogWarning("[RoomScan Setup] Meta Quest classic build profile not " +
-                                 "found \u2014 falling back to plain Android target. " +
-                                 "Run File > Build Profiles once to let Unity register the " +
-                                 "Meta Quest platform, then re-run this wizard.");
-                EditorUserBuildSettings.SwitchActiveBuildTarget(
-                    BuildTargetGroup.Android, BuildTarget.Android);
+                Debug.LogWarning("[RoomScan Setup] Could not switch to the plain Android platform. " +
+                                 "Select Android in File > Build Profiles by hand; continuing with " +
+                                 "the rest of " + flowName + ".");
+                return false;
             }
 
             // Drop the in-progress flag — the domain reload will wipe state
@@ -2127,12 +2261,12 @@ namespace Genesis.RoomScan.Editor
                 if (TrySwitchToAndroidBuildTarget("Setup Everything")) return;
 
                 EditorUtility.DisplayProgressBar("Setup Everything",
-                    "Fixing VR prerequisites (Outstanding + Recommended)\u2026", 0.05f);
+                    "Fixing Android XR prerequisites (Outstanding + Recommended)\u2026", 0.05f);
                 VRProjectBootstrap.Audit();
 
                 // URP must exist before anything else so shaders resolve.
                 EditorUtility.DisplayProgressBar("Setup Everything",
-                    "Ensuring URP pipeline + Quest-friendly defaults\u2026", 0.10f);
+                    "Ensuring URP pipeline + Android XR defaults\u2026", 0.10f);
                 EnsureURPSetup();
 
                 await VRProjectBootstrap.FixAllAsync(CheckSeverity.Recommended);
@@ -2150,13 +2284,11 @@ namespace Genesis.RoomScan.Editor
                 if (_arSession == null) FixARSession();
                 if (_arOcclusion == null) FixAROcclusion();
 
-                // See the matching comment in FixGameReadyModules — run
-                // unconditionally so this restores anything OVRProjectSetup
-                // stripped during the Recommended VR fix pass above.
+                // Idempotent: CAMERA + cleartext module, Quest entries
+                // stripped from any custom main manifest.
                 EditorUtility.DisplayProgressBar("Setup Everything",
-                    "Updating AndroidManifest + Player Settings\u2026", 0.50f);
-                EnsureQuestVRManifest();
-                if (!_cleartextAllowed) FixCleartextTraffic();
+                    "Updating Android manifest additions + Player Settings\u2026", 0.50f);
+                EnsureAndroidXRManifest();
                 if (!_insecureHttpAllowed)
                 {
                     PlayerSettings.insecureHttpOption = InsecureHttpOption.AlwaysAllowed;

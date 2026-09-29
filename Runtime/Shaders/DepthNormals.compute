@@ -48,3 +48,56 @@ void MonoRawDepthToStereo(uint2 id : SV_DispatchThreadID)
     gsDepthTexRW[uint3(id.xy, 0)] = depth;
     gsDepthTexRW[uint3(id.xy, 1)] = depth;
 }
+
+// Android XR (XR_LINEAR_DEPTH): the occlusion provider delivers per-eye
+// linear depth in metres (0 = invalid, +Inf = very far). Re-encode it into
+// the [0,1] non-linear NDC that gsDepthNDCToLinear / gsDepthNDCtoWorld decode
+// (near = 0, far = 1, not reversed), so nothing downstream ever sees metres.
+//   gsLinearDepthNdcParams = (A, B, near, far): A = gsDepthProj._m22 and
+//     B = _m23 of the projection DepthCapture builds from the same near/far,
+//     so this is the exact inverse of gsDepthNDCToLinear:
+//     ndc01 = 0.5 * (B / z - A) + 0.5.
+//   gsLinearDepthInfo = (width, height, source slice count, flipY 0/1)
+// 0, negatives, NaN, -Inf and anything closer than near -> 0, the value the
+// pipeline already treats as "no depth" (DepthDilation never propagates it,
+// TriplanarBake and DepthVisualize skip <= 0.001, VolumeIntegration sees a
+// near-plane hit whose band ends before any voxel it samples).
+// +Inf and anything at or beyond far -> 0 as well by default. With
+// gsLinearDepthInfo2.x = 1 (carveOnInfiniteDepth) they become 1 instead, a
+// finite far-plane hit that carves free space along the ray.
+Texture2DArray<float> gsInputLinearDepth;
+float4 gsLinearDepthNdcParams;
+float4 gsLinearDepthInfo;
+float4 gsLinearDepthInfo2;
+
+#pragma kernel LinearDepthToNDC
+
+[numthreads(8, 8, 1)]
+void LinearDepthToNDC(uint3 id : SV_DispatchThreadID)
+{
+    uint2 size = (uint2)gsLinearDepthInfo.xy;
+    if (id.x >= size.x || id.y >= size.y) return;
+
+    uint srcY = gsLinearDepthInfo.w > 0.5 ? size.y - 1u - id.y : id.y;
+    uint srcSlice = min(id.z, (uint)max(gsLinearDepthInfo.z, 1.0) - 1u);
+    float z = gsInputLinearDepth[uint3(id.x, srcY, srcSlice)];
+
+    // Classify by bit pattern: shader compilers may fold isnan()/isinf() away.
+    uint bits = asuint(z);
+    bool posInf = bits == 0x7F800000u;
+    bool nonFinite = (bits & 0x7F800000u) == 0x7F800000u; // NaN or +/-Inf
+
+    float A = gsLinearDepthNdcParams.x;
+    float B = gsLinearDepthNdcParams.y;
+    float near = gsLinearDepthNdcParams.z;
+    float far = gsLinearDepthNdcParams.w;
+
+    float farNdc = gsLinearDepthInfo2.x > 0.5 ? 1.0 : 0.0;
+    float ndc = 0.0;
+    if (posInf)
+        ndc = farNdc;
+    else if (!nonFinite && z >= near)
+        ndc = z >= far ? farNdc : saturate(0.5 * (B / z - A) + 0.5);
+
+    gsDepthTexRW[id] = ndc;
+}

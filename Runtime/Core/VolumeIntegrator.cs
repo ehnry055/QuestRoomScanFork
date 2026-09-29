@@ -47,8 +47,8 @@ namespace Genesis.RoomScan
         public float MinMeshWeight => minMeshWeight;
 
         [Header("Camera Color")]
-        [Tooltip("Exposure boost for camera texture. Quest 3 passthrough cameras produce dim images. (default 3.0)")]
-        [SerializeField, Range(1f, 10f)] private float cameraExposure = 3f;
+        [Tooltip("Exposure multiplier for the camera texture. Galaxy XR's world-facing camera frames are already auto-exposed, so 1 leaves them unchanged. (default 1.0)")]
+        [SerializeField, Range(1f, 10f)] private float cameraExposure = 1f;
 
         private RenderTexture _volume;
         private RenderTexture _colorVolume;

@@ -104,7 +104,7 @@ namespace Genesis.RoomScan.AIDetection
         /// </summary>
         private struct CameraSnapshot
         {
-            public Pose pose;          // world-space (already TrackingToWorld'd)
+            public Pose pose;          // world-space, as delivered by the camera provider
             public Vector2 focal;      // sensor-space focal length
             public Vector2 principal;  // sensor-space principal point
             public Vector2 sensorRes;  // native sensor resolution

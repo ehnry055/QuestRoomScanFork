@@ -51,11 +51,11 @@ namespace Genesis.RoomScan
         [SerializeField, Tooltip("Controller button → action mappings. Editable at runtime.")]
         private List<ScanInputBinding> bindings = new()
         {
-            // Left thumbstick click. NOTE: ScanButton.LeftMenu (left ≡) is
-            // NOT reserved by Horizon OS — only the right system button is.
-            // We use thumbstick-click here instead so host apps remain free to
-            // wire LeftMenu to their own pause menu, which is the standard
-            // convention on Quest titles.
+            // Left thumbstick click. ScanButton.LeftMenu (left ≡) is left
+            // free so host apps can wire it to their own pause menu, the
+            // usual convention for XR titles; the right-hand system button
+            // belongs to the OS. Galaxy XR controllers use the Oculus Touch
+            // interaction profile — confirm these bindings on the device.
             new() { action = ScanAction.ToggleDebugMenu,     button = ScanButton.LeftThumbstickClick, enabled = true },
             new() { action = ScanAction.FreezeInView,        button = ScanButton.RightPrimary,   enabled = true },
             new() { action = ScanAction.UnfreezeInView,      button = ScanButton.RightSecondary,   enabled = true },

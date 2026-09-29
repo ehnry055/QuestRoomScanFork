@@ -39,6 +39,11 @@
       "name": "com.unity.ai.inference",
       "expression": "",
       "define": "HAS_AI_INFERENCE"
+    },
+    {
+      "name": "Unity",
+      "expression": "6000.0.4",
+      "define": "UNITY_6000_0_4_OR_NEWER"
     }
   ],
   "noEngineReferences": false
