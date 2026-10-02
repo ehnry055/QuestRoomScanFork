@@ -6,6 +6,27 @@ All notable changes to this package are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `ScanWorldLock` (added to the RoomScanner GameObject automatically):
+  the first scan of an app session creates an `ARAnchor` and the XR
+  Origin is moved every frame so that anchor stays at its locked world
+  pose. Tracking-origin changes from the runtime (Galaxy XR sends
+  `ReferenceSpaceChangePending` on every wake from sleep and several
+  times a minute) no longer offset new depth against the world-space
+  TSDF, which used to carve holes and duplicate surfaces. Integration,
+  colour feeding and keyframes pause while `IsSettling` (after a jump,
+  a tracking-origin update, resume / focus, or while the anchor or AR
+  session is not tracking). Without an anchor subsystem the scan runs
+  uncompensated with the same settle gating. A transient lock failure,
+  or a removed anchor, is retried every 5 s while the AR session tracks
+  (no scan restart needed). A locked anchor that stops tracking holds
+  the scan paused until it tracks again; it is only dropped and
+  re-locked at the present pose once the scan is stopped (or with
+  `dropLostAnchorWhileScanning`). Not-tracking time is app time, so
+  time asleep never counts. `IsSettling` reads false while the
+  component is disabled.
+
 ## [1.3.1] - 2026-09-19
 
 The package now lives at

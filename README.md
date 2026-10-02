@@ -301,7 +301,9 @@ RoomScanner (orchestrator, events, scan lifecycle)
   ├── VolumeIntegrator (TSDF + color integration, exclusion zones, prune, freeze)
   ├── MeshExtractor → GPUSurfaceNets → GPUMeshRenderer (fully GPU-driven mesh)
   ├── RoomScanPersistence (package-based multi-scan persistence)
-  └── RoomAnchorManager (OVRSpatialAnchor relocation)
+  ├── RoomAnchorManager (OVRSpatialAnchor relocation)
+  └── ScanWorldLock (auto-added: ARAnchor world lock — moves the XR Origin so tracking-origin
+        changes don't offset depth against the TSDF; pauses integration while settling)
 ```
 
 **Optional modules (add via inspector):**

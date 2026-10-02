@@ -3,7 +3,9 @@ Shader "Genesis/ScanMeshVertexColor"
     Properties { }
     SubShader
     {
-        Tags { "RenderType"="Opaque" "RenderPipeline"="UniversalPipeline" "Queue"="Geometry" }
+        // Transparent queue so the see-through live mesh draws after opaque
+        // content (UI, refined mesh) instead of hiding it behind its depth.
+        Tags { "RenderType"="Transparent" "RenderPipeline"="UniversalPipeline" "Queue"="Transparent" }
 
         Pass
         {
@@ -11,6 +13,10 @@ Shader "Genesis/ScanMeshVertexColor"
             Tags { "LightMode"="SRPDefaultUnlit" }
             ZWrite On
             ZTest LEqual
+            // Alpha = mesh opacity. The camera clears to (0,0,0,0) for
+            // passthrough, so colour comes out premultiplied and the alpha
+            // channel tells the compositor how much passthrough to keep.
+            Blend SrcAlpha OneMinusSrcAlpha, One OneMinusSrcAlpha
 
             HLSLPROGRAM
             #pragma vertex vert
@@ -65,6 +71,8 @@ Shader "Genesis/ScanMeshVertexColor"
             float _RSWireThickness;
             // 1 = tint the surface where the analysis found a leak face.
             float _RSShowHoles;
+            // 1 - live mesh opacity (set by MeshExtractor). Unset = 0 = solid.
+            float _RSMeshTransparency;
 
             #define DEPTH_TOLERANCE 0.015
 
@@ -236,7 +244,7 @@ Shader "Genesis/ScanMeshVertexColor"
                     return half4(wireColor, 1);
                 }
 
-                return half4(baseColor, 1);
+                return half4(baseColor, 1.0h - saturate((half)_RSMeshTransparency));
             }
             ENDHLSL
         }

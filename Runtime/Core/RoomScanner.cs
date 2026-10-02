@@ -231,6 +231,7 @@ namespace Genesis.RoomScan
         private MeshExtractor _meshExtractor;
         private RoomScanPersistence _persistence;
         private RoomAnchorManager _roomAnchor;
+        private ScanWorldLock _worldLock;
 
         // Optional modules (discovered, not required)
         private PassthroughCameraProvider _cameraProvider;
@@ -310,6 +311,13 @@ namespace Genesis.RoomScan
         public DepthCapture DepthCapture => _depthCapture;
         /// <summary>The core mesh extractor component.</summary>
         public MeshExtractor MeshExtractor => _meshExtractor;
+        /// <summary>
+        /// Keeps Unity world locked to the room across tracking-origin changes
+        /// (added to this GameObject when missing). While its
+        /// <see cref="ScanWorldLock.IsSettling"/> is set, integration, colour
+        /// feeding and keyframe capture are skipped; the scan keeps running.
+        /// </summary>
+        public ScanWorldLock WorldLock => _worldLock;
         /// <summary>The active camera provider (custom, else the sibling <see cref="PassthroughCameraProvider"/>), or null.</summary>
         public ICameraProvider ActiveCameraProvider => GetActiveCameraProvider();
         /// <summary>The optional Gaussian Splat provider, or null if the GSplat module is not attached.</summary>
@@ -531,6 +539,12 @@ namespace Genesis.RoomScan
             _roomUnderstanding = GetComponent<RoomUnderstanding>();
             _debugMenu = GetComponentInChildren<DebugMenuController>();
             _roomAnchor = GetComponent<RoomAnchorManager>();
+
+            // Not a RequireComponent so scenes saved before it existed need no
+            // migration: added here, before any scan can start.
+            _worldLock = GetComponent<ScanWorldLock>();
+            if (_worldLock == null)
+                _worldLock = gameObject.AddComponent<ScanWorldLock>();
         }
 
         /// <summary>
@@ -592,12 +606,31 @@ namespace Genesis.RoomScan
             if (renderMode == ScanRenderMode.Vertex)
                 Shader.SetGlobalFloat(TriAvailableID, 0f);
 
-            if (!IsScanning || !DepthCapture.DepthAvailable) return;
+            if (!IsScanning) return;
+
+            int depthSerial = _depthCapture != null ? _depthCapture.DepthFrameSerial : -1;
+
+            // World lock settling: the tracking origin just moved (or is not
+            // trustworthy), so the buffered depth frame and camera frame may
+            // pair a pose from one side of the change with the XR Origin from
+            // the other. Fuse nothing — no TSDF, no colour, no keyframes — and
+            // mark what is buffered now as used, so the first integration
+            // after the settle waits for frames captured after it. Done before
+            // the DepthAvailable early-out: depth drops out across a resume,
+            // which is exactly when this matters.
+            bool settling = _worldLock != null && _worldLock.IsSettling;
+            if (settling)
+            {
+                _lastIntegratedDepthSerial = depthSerial;
+                SkipBufferedColorFrame();
+            }
+
+            if (!DepthCapture.DepthAvailable) return;
 
             float t = Time.time;
 
-            int depthSerial = _depthCapture != null ? _depthCapture.DepthFrameSerial : -1;
-            if (t - _lastIntegrationTime >= IntegrationInterval
+            if (!settling
+                && t - _lastIntegrationTime >= IntegrationInterval
                 && (depthSerial < 0 || depthSerial != _lastIntegratedDepthSerial))
             {
                 _lastIntegrationTime = t;
@@ -843,6 +876,15 @@ namespace Genesis.RoomScan
                 // first frame some ticks later; depth starts through
                 // AROcclusionManager. Passthrough (ARCameraManager) is not
                 // touched here — it stays on for the app's lifetime.
+                //
+                // World lock: the first scan of the app session anchors Unity
+                // world to the room (non-blocking; later starts, resumed or
+                // not, keep that anchor), so tracking-origin changes from the
+                // runtime (wake from sleep, recentring) do not offset new
+                // depth against the fixed TSDF grid. Permissions, including
+                // SCENE_UNDERSTANDING_COARSE for anchors, were requested above.
+                _worldLock?.EnsureLocked();
+
                 ICameraProvider provider = GetActiveCameraProvider();
                 provider?.StartCapture();
                 _depthCapture.StartDepthCapture();
@@ -2203,6 +2245,22 @@ namespace Genesis.RoomScan
         // ICameraFrameTiming.FrameTimeSeconds of the last camera frame handed
         // to integration; NaN = none yet this scan. Each frame is used once.
         private double _lastColorFrameTime = double.NaN;
+
+        /// <summary>
+        /// Marks the camera frame the provider holds now as used, without
+        /// feeding it, so a frame captured while <see cref="ScanWorldLock"/>
+        /// is settling never reaches the colour volume, triplanar cache or
+        /// keyframes afterwards. Providers without
+        /// <see cref="ICameraFrameTiming"/> only report a frame on the tick it
+        /// arrives, so there is nothing buffered to skip.
+        /// </summary>
+        private void SkipBufferedColorFrame()
+        {
+            ICameraProvider provider = GetActiveCameraProvider();
+            if (provider is ICameraFrameTiming timing && provider.IsPlaying)
+                _lastColorFrameTime = timing.FrameTimeSeconds;
+        }
+
         private void ProvideColorFrame()
         {
             ICameraProvider provider = GetActiveCameraProvider();

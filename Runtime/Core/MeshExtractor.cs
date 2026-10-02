@@ -45,6 +45,16 @@ namespace Genesis.RoomScan
         [Header("Rendering")]
         [SerializeField] private Material scanMeshMaterial;
 
+        [SerializeField, Tooltip("Live mesh opacity over passthrough. 1 = solid; lower values let the real room show through so walking around is less obstructed. Wireframe edges stay solid.")]
+        [Range(0.05f, 1f)] private float meshOpacity = 0.7f;
+
+        /// <summary>Live mesh opacity over passthrough (0.05-1). Applied every frame.</summary>
+        public float MeshOpacity
+        {
+            get => meshOpacity;
+            set => meshOpacity = Mathf.Clamp(value, 0.05f, 1f);
+        }
+
         [Header("Compute")]
         [SerializeField] public ComputeShader surfaceNetsCompute;
         [SerializeField, Tooltip("Max vertex fraction of total voxels (0.01-0.10).")]
@@ -63,6 +73,7 @@ namespace Genesis.RoomScan
         static readonly int ExtractTimeID = Shader.PropertyToID("_RSExtractTime");
         static readonly int ExtractIntervalID = Shader.PropertyToID("_RSExtractInterval");
         static readonly int MorphStartID = Shader.PropertyToID("_RSMorphStart");
+        static readonly int MeshTransparencyID = Shader.PropertyToID("_RSMeshTransparency");
         static readonly int MorphSecID = Shader.PropertyToID("_RSMorphSec");
 
         internal GPUSurfaceNets GpuSurfaceNets => _gpuSurfaceNets;
@@ -117,6 +128,13 @@ namespace Genesis.RoomScan
         {
             if (_gpuSurfaceNets != null) return;
             Init();
+        }
+
+        private void LateUpdate()
+        {
+            // Every frame, not per extract, so opacity changes apply while
+            // extraction is held or the scan is stopped.
+            Shader.SetGlobalFloat(MeshTransparencyID, 1f - meshOpacity);
         }
 
         private void OnDestroy()
